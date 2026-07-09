@@ -189,27 +189,26 @@ jobs:
       - name: Scan DLLs for patterns
         run: |
           $outputDir = "output"
-          $dllDir = $outputDir
           
           Write-Host "=== Running pattern scanner ==="
           
           # Scan steamclient64.dll
-          $clientDll = Join-Path $dllDir "steamclient64.dll"
+          $clientDll = "$outputDir\steamclient64.dll"
           if (Test-Path $clientDll) {
             Write-Host "Scanning steamclient64.dll..."
-            python tools/sig_scanner.py $clientDll $outputDir\steamclient64.toml
+            python tools/sig_scanner.py --dll $clientDll --component steamclient --output "$outputDir\steamclient64.toml"
           }
           
           # Scan steamui.dll
-          $uiDll = Join-Path $dllDir "steamui.dll"
+          $uiDll = "$outputDir\steamui.dll"
           if (Test-Path $uiDll) {
             Write-Host "Scanning steamui.dll..."
-            python tools/sig_scanner.py $uiDll $outputDir\steamui.toml
+            python tools/sig_scanner.py --dll $uiDll --component steamui --output "$outputDir\steamui.toml"
           }
           
           # Extract IPC vtables
           Write-Host "=== Running IPC extractor ==="
-          python tools/ipc_extractor.py $dllDir\steamclient64.dll $outputDir\ipc_vtables.toml
+          python tools/ipc_extractor.py --dll "$outputDir\steamclient64.dll" --output "$outputDir\ipc_vtables.toml"
 
       - name: Create archive
         run: |
