@@ -1,0 +1,204 @@
+name: Dump Steam Patterns
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */6 * * *'  # Every 6 hours
+
+jobs:
+  dump-patterns:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pefile
+
+      - name: Install Steam (Silent)
+        run: |
+          # Create installation directory
+          $installDir = "C:\Steam"
+          New-Item -ItemType Directory -Force -Path $installDir
+          
+          # Run Steam installer silently
+          # /S = silent, /D = install directory
+          Start-Process -FilePath ".\SteamSetup.exe" -ArgumentList "/S" -Wait -NoNewWindow
+          
+          # Wait for installation to complete
+          Start-Sleep -Seconds 30
+          
+          # Find Steam installation
+          $steamPaths = @(
+            "C:\Program Files (x86)\Steam",
+            "C:\Program Files\Steam",
+            "C:\Steam",
+            "$env:LOCALAPPDATA\Steam"
+          )
+          
+          $steamPath = $null
+          foreach ($path in $steamPaths) {
+            if (Test-Path "$path\steam.exe") {
+              $steamPath = $path
+              break
+            }
+          }
+          
+          if (-not $steamPath) {
+            # Try to find it
+            $steamPath = Get-ChildItem -Path "C:\" -Filter "steam.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty DirectoryName
+          }
+          
+          if ($steamPath) {
+            echo "STEAM_PATH=$steamPath" | Out-File -FilePath $env:GITHUB_ENV -Append
+            Write-Host "Steam found at: $steamPath"
+          } else {
+            Write-Host "WARNING: Steam.exe not found, will try common paths"
+            echo "STEAM_PATH=C:\Program Files (x86)\Steam" | Out-File -FilePath $env:GITHUB_ENV -Append
+          }
+
+      - name: Wait for Steam to initialize
+        run: |
+          # Give Steam time to create necessary files
+          Start-Sleep -Seconds 15
+          
+          $steamPath = $env:STEAM_PATH
+          if (Test-Path "$steamPath\steamclient64.dll") {
+            Write-Host "steamclient64.dll found"
+          } else {
+            Write-Host "steamclient64.dll not found, listing directory contents:"
+            Get-ChildItem -Path $steamPath -ErrorAction SilentlyContinue | Select-Object Name
+          }
+
+      - name: Extract DLL files
+        id: extract
+        run: |
+          $steamPath = $env:STEAM_PATH
+          $outputDir = "output"
+          New-Item -ItemType Directory -Force -Path $outputDir
+          
+          # Copy DLLs
+          $dlls = @("steamclient64.dll", "steamui.dll")
+          foreach ($dll in $dlls) {
+            $src = Join-Path $steamPath $dll
+            $dst = Join-Path $outputDir $dll
+            if (Test-Path $src) {
+              Copy-Item -Path $src -Destination $dst -Force
+              Write-Host "Copied: $dll"
+            } else {
+              Write-Host "WARNING: $dll not found at $src"
+            }
+          }
+          
+          # List all DLLs for debugging
+          Write-Host "`nAll DLLs in Steam directory:"
+          Get-ChildItem -Path $steamPath -Filter "*.dll" | Select-Object Name, Length
+
+      - name: Run Pattern Dumper
+        run: |
+          $steamPath = $env:STEAM_PATH
+          $outputDir = "output"
+          
+          # Build arguments
+          $args = @()
+          
+          if (Test-Path "$outputDir\steamclient64.dll") {
+            $args += "--steamclient-dll"
+            $args += "$outputDir\steamclient64.dll"
+          }
+          
+          if (Test-Path "$outputDir\steamui.dll") {
+            $args += "--steamui-dll"
+            $args += "$outputDir\steamui.dll"
+          }
+          
+          $args += "--output-dir"
+          $args += "$outputDir\patterns"
+          
+          Write-Host "Running: python dump_patterns.py $($args -join ' ')"
+          python dump_patterns.py @args
+
+      - name: Generate Steam diagnostics
+        run: |
+          $steamPath = $env:STEAM_PATH
+          $outputDir = "output"
+          
+          # Get Steam version info
+          $steamExe = Join-Path $steamPath "steam.exe"
+          if (Test-Path $steamExe) {
+            $version = (Get-Item $steamExe).VersionInfo.FileVersion
+            Write-Host "Steam version: $version"
+            
+            # Save version info
+            @{
+              steam_path = $steamPath
+              steam_version = $version
+              timestamp = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+            } | ConvertTo-Json | Out-File "$outputDir\patterns\steam_info.json"
+          }
+          
+          # Get DLL hashes
+          $dlls = @("steamclient64.dll", "steamui.dll")
+          foreach ($dll in $dlls) {
+            $path = Join-Path $outputDir $dll
+            if (Test-Path $path) {
+              $hash = (Get-FileHash -Path $path -Algorithm SHA256).Hash
+              Write-Host "$dll SHA-256: $hash"
+            }
+          }
+
+      - name: Create output archive
+        run: |
+          $outputDir = "output\patterns"
+          $archiveName = "steam-patterns-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+          
+          # Create ZIP archive
+          Compress-Archive -Path "$outputDir\*" -DestinationPath "$archiveName.zip" -Force
+          
+          Write-Host "Created archive: $archiveName.zip"
+          $archiveSize = (Get-Item "$archiveName.zip").Length / 1MB
+          Write-Host "Archive size: $([math]::Round($archiveSize, 2)) MB"
+
+      - name: Upload pattern artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: steam-patterns-${{ github.run_number }}
+          path: |
+            output/patterns/*.toml
+            output/patterns/*.json
+          retention-days: 30
+
+      - name: Upload archive artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: steam-patterns-archive-${{ github.run_number }}
+          path: "*.zip"
+          retention-days: 30
+
+      - name: Print results summary
+        if: always()
+        run: |
+          Write-Host "`n=========================================="
+          Write-Host "RESULTS SUMMARY"
+          Write-Host "=========================================="
+          
+          if (Test-Path "output\patterns\summary.json") {
+            $summary = Get-Content "output\patterns\summary.json" | ConvertFrom-Json
+            Write-Host ($summary | ConvertTo-Json -Depth 3)
+          }
+          
+          Write-Host "`nGenerated files:"
+          if (Test-Path "output\patterns") {
+            Get-ChildItem "output\patterns" | ForEach-Object {
+              Write-Host "  $($_.Name) ($([math]::Round($_.Length / 1KB, 2)) KB)"
+            }
+          }
