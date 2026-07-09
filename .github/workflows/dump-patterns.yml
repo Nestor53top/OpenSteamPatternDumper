@@ -24,49 +24,81 @@ jobs:
           python -m pip install --upgrade pip
           pip install pefile requests
 
-      - name: Download existing patterns from steam-monitor
+      - name: Download latest patterns from steam-monitor
         run: |
-          # Create directories for existing patterns
+          # Create directories for patterns
           New-Item -ItemType Directory -Force -Path "existing_patterns\steamclient"
           New-Item -ItemType Directory -Force -Path "existing_patterns\steamui"
           
-          # Download all pattern files from steam-monitor
-          # First, get the list of files in the pattern branch
+          # Download the latest pattern files from steam-monitor
           $baseUri = "https://raw.githubusercontent.com/OpenSteam001/steam-monitor/pattern"
           
-          # Known function names to track (from OpenSteamTool)
-          $steamclientFunctions = @(
-            "CheckAppOwnership", "ConfigStoreGetBinary", "BuildDepotDependency",
-            "IPCProcessMessage", "BBuildAndAsyncSendFrame", "RecvPkt",
-            "SendCallbackToPipe", "SpawnProcess", "GetPackageInfo",
-            "MarkLicenseAsChanged", "ProcessPendingLicenseUpdates",
-            "GetPipeClient", "GetAppDataFromAppInfo", "GetAppIDForCurrentPipe",
-            "OptedInMask", "BuildSpawnEnvBlock", "PchMsgNameFromEMsg",
-            "CUtlBufferEnsureCapacity", "CUtlMemoryGrow", "GetOrAddAppData",
-            "LoadDepotDecryptionKey", "LoadPackage", "KeyValues_ReadAsBinary",
-            "KeyValues_FindOrCreateKey", "CloseAppCloud", "AddProtobufAsBinary"
-          )
+          # Get list of pattern files
+          $steamclientFiles = Invoke-RestMethod -Uri "https://api.github.com/repos/OpenSteam001/steam-monitor/contents/steamclient?ref=pattern" -Headers @{"Authorization"="token $env:GITHUB_TOKEN"}
+          $steamuiFiles = Invoke-RestMethod -Uri "https://api.github.com/repos/OpenSteam001/steam-monitor/contents/steamui?ref=pattern" -Headers @{"Authorization"="token $env:GITHUB_TOKEN"}
           
-          $steamuiFunctions = @(
-            "FillInAppOverview", "BuildCompleteAppOverviewChange",
-            "CSteamUIAppControllerRunFrame", "GetAppByID", "MarkAppChange",
-            "RepeatedFieldUint32_Add", "ShouldShowAppInLibrary",
-            "AddProtobufAsBinary", "GetTopManager", "LoadModuleWithPath"
-          )
-          
-          # Create a combined function list JSON for the scanner
-          $allFunctions = @{}
-          foreach ($func in $steamclientFunctions) {
-            $allFunctions[$func] = @{"component" = "steamclient"}
+          # Download the latest steamclient pattern (sort by name, take last)
+          $latestSteamclient = ($steamclientFiles | Where-Object { $_.name -like "*.toml" } | Sort-Object name | Select-Object -Last 1)
+          if ($latestSteamclient) {
+            $url = "$baseUri/steamclient/$($latestSteamclient.name)"
+            Write-Host "Downloading: $url"
+            Invoke-WebRequest -Uri $url -OutFile "existing_patterns\steamclient\$($latestSteamclient.name)" -Headers @{"Authorization"="token $env:GITHUB_TOKEN"}
+            Write-Host "Downloaded: $($latestSteamclient.name)"
+            
+            # Parse the TOML to extract function signatures
+            $content = Get-Content "existing_patterns\steamclient\$($latestSteamclient.name)" -Raw
+            Write-Host "Content length: $($content.Length) bytes"
           }
-          foreach ($func in $steamuiFunctions) {
-            $allFunctions[$func] = @{"component" = "steamui"}
+          
+          # Download the latest steamui pattern
+          $latestSteamui = ($steamuiFiles | Where-Object { $_.name -like "*.toml" } | Sort-Object name | Select-Object -Last 1)
+          if ($latestSteamui) {
+            $url = "$baseUri/steamui/$($latestSteamui.name)"
+            Write-Host "Downloading: $url"
+            Invoke-WebRequest -Uri $url -OutFile "existing_patterns\steamui\$($latestSteamui.name)" -Headers @{"Authorization"="token $env:GITHUB_TOKEN"}
+            Write-Host "Downloaded: $($latestSteamui.name)"
+          }
+          
+          # Create a combined function list from the downloaded patterns
+          $allFunctions = @{}
+          
+          # Parse steamclient patterns
+          if (Test-Path "existing_patterns\steamclient\*.toml") {
+            $patternFile = Get-ChildItem "existing_patterns\steamclient\*.toml" | Select-Object -First 1
+            $content = Get-Content $patternFile.FullName -Raw
+            
+            # Extract function names and signatures
+            $matches = [regex]::Matches($content, '\[(0x[0-9A-Fa-f]+)\]\s*\n\s*name\s*=\s*"([^"]+)"\s*\n\s*rva\s*=\s*"([^"]+)"\s*\n\s*sig\s*=\s*"([^"]+)"')
+            foreach ($match in $matches) {
+              $funcName = $match.Groups[2].Value
+              $sig = $match.Groups[4].Value
+              $allFunctions[$funcName] = @{
+                "component" = "steamclient"
+                "sig" = $sig
+              }
+            }
+          }
+          
+          # Parse steamui patterns
+          if (Test-Path "existing_patterns\steamui\*.toml") {
+            $patternFile = Get-ChildItem "existing_patterns\steamui\*.toml" | Select-Object -First 1
+            $content = Get-Content $patternFile.FullName -Raw
+            
+            $matches = [regex]::Matches($content, '\[(0x[0-9A-Fa-f]+)\]\s*\n\s*name\s*=\s*"([^"]+)"\s*\n\s*rva\s*=\s*"([^"]+)"\s*\n\s*sig\s*=\s*"([^"]+)"')
+            foreach ($match in $matches) {
+              $funcName = $match.Groups[2].Value
+              $sig = $match.Groups[4].Value
+              $allFunctions[$funcName] = @{
+                "component" = "steamui"
+                "sig" = $sig
+              }
+            }
           }
           
           # Save function list
-          $allFunctions | ConvertTo-Json | Out-File "existing_patterns\functions.json" -Encoding UTF8
+          $allFunctions | ConvertTo-Json -Depth 3 | Out-File "existing_patterns\functions.json" -Encoding UTF8
           
-          Write-Host "Created function list with $($allFunctions.Count) functions"
+          Write-Host "Extracted $($allFunctions.Count) function signatures from steam-monitor"
 
       - name: Install Steam (Silent)
         run: |
