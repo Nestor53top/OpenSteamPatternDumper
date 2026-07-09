@@ -24,14 +24,18 @@ jobs:
           python -m pip install --upgrade pip
           pip install pefile requests
 
-      - name: Install Steam
+      - name: Install and run Steam to download files
         run: |
           $installDir = "C:\Steam"
           New-Item -ItemType Directory -Force -Path $installDir
+          
+          Write-Host "=== Installing Steam ==="
           Start-Process -FilePath ".\SteamSetup.exe" -ArgumentList "/S" -Wait -NoNewWindow
           Start-Sleep -Seconds 10
           
-          $steamPaths = @(
+          # Find Steam installation
+          $steamPath = $null
+          $possiblePaths = @(
             "C:\Program Files (x86)\Steam",
             "C:\Program Files\Steam",
             "C:\Steam",
@@ -40,8 +44,7 @@ jobs:
             "$env:PROGRAMFILES(X86)\Steam"
           )
           
-          $steamPath = $null
-          foreach ($path in $steamPaths) {
+          foreach ($path in $possiblePaths) {
             if (Test-Path "$path\steam.exe") {
               $steamPath = $path
               break
@@ -52,97 +55,83 @@ jobs:
             $steamPath = Get-ChildItem -Path "C:\" -Filter "steam.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty DirectoryName
           }
           
-          if ($steamPath) {
-            echo "STEAM_PATH=$steamPath" | Out-File -FilePath $env:GITHUB_ENV -Append
-            Write-Host "Steam found at: $steamPath"
-          } else {
-            echo "STEAM_PATH=C:\Program Files (x86)\Steam" | Out-File -FilePath $env:GITHUB_ENV -Append
+          if (-not $steamPath) {
+            $steamPath = "C:\Program Files (x86)\Steam"
           }
-
-      - name: Launch and kill Steam to generate DLLs
-        run: |
-          $steamPath = $env:STEAM_PATH
+          
+          echo "STEAM_PATH=$steamPath" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "Steam path: $steamPath"
+          
+          # Run Steam.exe to download client files
           $steamExe = Join-Path $steamPath "steam.exe"
-          
           if (Test-Path $steamExe) {
-            Write-Host "Launching Steam briefly..."
-            Start-Process -FilePath $steamExe -ArgumentList "-silent" -ErrorAction SilentlyContinue
-            Start-Sleep -Seconds 5
+            Write-Host "=== Running Steam to download client files ==="
             
-            Write-Host "Killing Steam..."
-            Get-Process -Name "steam" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-            Get-Process -Name "steamwebhelper" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-            Start-Sleep -Seconds 3
-          }
-
-      - name: Search for DLLs everywhere
-        run: |
-          $searchPaths = @(
-            "C:\Program Files (x86)\Steam",
-            "C:\Program Files\Steam",
-            "C:\Steam",
-            "$env:LOCALAPPDATA\Steam",
-            "$env:APPDATA\Steam",
-            "C:\"
-          )
-          
-          $dlls = @("steamclient64.dll", "steamui.dll", "steamclient.dll")
-          $found = @{}
-          
-          foreach ($searchPath in $searchPaths) {
-            if (Test-Path $searchPath) {
-              Write-Host "Searching in: $searchPath"
-              foreach ($dll in $dlls) {
-                $found = Get-ChildItem -Path $searchPath -Filter $dll -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-                if ($found) {
-                  Write-Host "  FOUND: $($found.FullName)"
-                  echo "DLL_$($dll.Replace('.dll',''))=$($found.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+            # Start Steam with various flags to force download
+            Start-Process -FilePath $steamExe -ArgumentList "-no-browser -nochatui -silent" -ErrorAction SilentlyContinue
+            
+            # Wait for DLLs to appear (check every 5 seconds for 2 minutes)
+            $maxWait = 120
+            $elapsed = 0
+            $dllsFound = @()
+            
+            while ($elapsed -lt $maxWait) {
+              Start-Sleep -Seconds 5
+              $elapsed += 5
+              
+              # Check for DLLs
+              $targetDlls = @("steamclient64.dll", "steamui.dll")
+              foreach ($dll in $targetDlls) {
+                $dllPath = Join-Path $steamPath $dll
+                if (Test-Path $dllPath) {
+                  $size = (Get-Item $dllPath).Length
+                  if ($size -gt 1000000) {  # At least 1MB
+                    Write-Host "  FOUND: $dll ($([math]::Round($size/1MB, 2)) MB)"
+                    $dllsFound += $dll
+                  }
                 }
               }
-            }
-          }
-          
-          # Also try finding steam.exe location
-          $steamExes = Get-ChildItem -Path "C:\" -Filter "steam.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 3
-          foreach ($exe in $steamExes) {
-            Write-Host "Found steam.exe at: $($exe.DirectoryName)"
-            $parentDir = $exe.DirectoryName
-            foreach ($dll in $dlls) {
-              $dllPath = Join-Path $parentDir $dll
-              if (Test-Path $dllPath) {
-                Write-Host "  FOUND DLL: $dllPath"
-                echo "DLL_$($dll.Replace('.dll',''))=$dllPath" | Out-File -FilePath $env:GITHUB_ENV -Append
+              
+              if ($dllsFound.Count -ge 2) {
+                Write-Host "All DLLs found!"
+                break
               }
+              
+              Write-Host "  Waiting... ($elapsed/$maxWait sec) - Found: $($dllsFound.Count)/2"
+            }
+            
+            # Kill Steam
+            Write-Host "=== Killing Steam ==="
+            Get-Process -Name "steam" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+            Get-Process -Name "steamwebhelper" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+            Get-Process -Name "steam_oOo..." -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 3
+            
+            # Final check
+            Write-Host "=== Final DLL check ==="
+            Get-ChildItem -Path $steamPath -Filter "*.dll" | ForEach-Object {
+              Write-Host "  $($_.Name) - $([math]::Round($_.Length/1KB, 2)) KB"
             }
           }
 
       - name: Extract DLLs
         run: |
+          $steamPath = $env:STEAM_PATH
           $outputDir = "output"
           New-Item -ItemType Directory -Force -Path $outputDir
           
-          $dllEnvVars = @("DLL_steamclient64", "DLL_steamui", "DLL_steamclient")
-          $dllNames = @("steamclient64.dll", "steamui.dll", "steamclient.dll")
-          
-          for ($i = 0; $i -lt $dllEnvVars.Count; $i++) {
-            $envVar = $dllEnvVars[$i]
-            $dllName = $dllNames[$i]
-            $dllPath = [Environment]::GetEnvironmentVariable($envVar)
-            
-            if ($dllPath -and (Test-Path $dllPath)) {
-              $dst = Join-Path $outputDir $dllName
-              Copy-Item -Path $dllPath -Destination $dst -Force
+          $dlls = @("steamclient64.dll", "steamui.dll")
+          foreach ($dll in $dlls) {
+            $src = Join-Path $steamPath $dll
+            $dst = Join-Path $outputDir $dll
+            if (Test-Path $src) {
+              Copy-Item -Path $src -Destination $dst -Force
               $hash = (Get-FileHash -Path $dst -Algorithm SHA256).Hash.ToLower()
-              Write-Host "$dllName SHA-256: $hash (from $dllPath)"
-              echo "HASH_$($dllName.Replace('.dll',''))=$hash" | Out-File -FilePath $env:GITHUB_ENV -Append
+              Write-Host "$dll SHA-256: $hash"
+              echo "HASH_$($dll.Replace('.dll','').Replace('64',''))=$hash" | Out-File -FilePath $env:GITHUB_ENV -Append
             } else {
-              Write-Host "$dllName not found via env"
+              Write-Host "$dll NOT FOUND"
             }
-          }
-          
-          # Fallback: search in output dir
-          Get-ChildItem $outputDir -Filter "*.dll" -ErrorAction SilentlyContinue | ForEach-Object {
-            Write-Host "DLL in output: $($_.FullName)"
           }
 
       - name: Download patterns from steam-monitor
@@ -150,8 +139,11 @@ jobs:
           $outputDir = "output"
           New-Item -ItemType Directory -Force -Path "$outputDir\patterns"
           
-          $steamclientHash = $env:HASH_steamclient64
+          $steamclientHash = $env:HASH_steamclient
           $steamuiHash = $env:HASH_steamui
+          
+          Write-Host "steamclient hash: $steamclientHash"
+          Write-Host "steamui hash: $steamuiHash"
           
           $baseUri = "https://raw.githubusercontent.com/OpenSteam001/steam-monitor/pattern"
           
@@ -162,11 +154,9 @@ jobs:
               Invoke-WebRequest -Uri $url -OutFile $outFile -TimeoutSec 10 -ErrorAction Stop
               Write-Host "SUCCESS: Found steamclient pattern"
             } catch {
-              Write-Host "Pattern not found for steamclient ($steamclientHash)"
+              Write-Host "Pattern not found for steamclient"
               Set-Content -Path $outFile -Value "# SHA-256: $steamclientHash - not in steam-monitor"
             }
-          } else {
-            Write-Host "No steamclient hash available"
           }
           
           if ($steamuiHash) {
@@ -176,27 +166,25 @@ jobs:
               Invoke-WebRequest -Uri $url -OutFile $outFile -TimeoutSec 10 -ErrorAction Stop
               Write-Host "SUCCESS: Found steamui pattern"
             } catch {
-              Write-Host "Pattern not found for steamui ($steamuiHash)"
+              Write-Host "Pattern not found for steamui"
               Set-Content -Path $outFile -Value "# SHA-256: $steamuiHash - not in steam-monitor"
             }
-          } else {
-            Write-Host "No steamui hash available"
           }
           
+          # Save info
           $steamPath = $env:STEAM_PATH
-          $steamExe = Join-Path $steamPath "steam.exe"
           $version = "unknown"
+          $steamExe = Join-Path $steamPath "steam.exe"
           if (Test-Path $steamExe) {
             $version = (Get-Item $steamExe).VersionInfo.FileVersion
           }
           
-          $info = @{
+          @{
             steam_version = $version
             steamclient_hash = $steamclientHash
             steamui_hash = $steamuiHash
             timestamp = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
-          }
-          $info | ConvertTo-Json | Out-File "$outputDir\patterns\steam_info.json"
+          } | ConvertTo-Json | Out-File "$outputDir\patterns\steam_info.json"
 
       - name: Create archive
         run: |
