@@ -24,102 +24,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install pefile requests
 
-      - name: Download latest patterns from steam-monitor
-        run: |
-          # Create directories for patterns
-          New-Item -ItemType Directory -Force -Path "existing_patterns\steamclient"
-          New-Item -ItemType Directory -Force -Path "existing_patterns\steamui"
-          
-          # Download the latest pattern files from steam-monitor using raw URLs
-          # We'll try to download a known recent pattern file
-          $baseUri = "https://raw.githubusercontent.com/OpenSteam001/steam-monitor/pattern"
-          
-          # Known recent pattern files (from our earlier exploration)
-          $steamclientPatterns = @(
-            "fb916a146e36e109ebb49241f56f9cb99fabecf4f5caa7e2e73024d1038deee7.toml",
-            "38b75e0d99ce8a42165bf34c6dbb6efbe17071b17be2416d11c80538c50bd3ce.toml",
-            "ec96d11e.toml"
-          )
-          
-          $steamuiPatterns = @(
-            "4730bffa.toml",
-            "5a591020.toml",
-            "b535cf98.toml"
-          )
-          
-          # Try to download steamclient patterns
-          foreach ($pattern in $steamclientPatterns) {
-            $url = "$baseUri/steamclient/$pattern"
-            $outFile = "existing_patterns\steamclient\$pattern"
-            try {
-              Write-Host "Downloading: $url"
-              Invoke-WebRequest -Uri $url -OutFile $outFile -TimeoutSec 10
-              if (Test-Path $outFile) {
-                Write-Host "Downloaded: $pattern"
-                break
-              }
-            } catch {
-              Write-Host "Failed to download $pattern : $_"
-            }
-          }
-          
-          # Try to download steamui patterns
-          foreach ($pattern in $steamuiPatterns) {
-            $url = "$baseUri/steamui/$pattern"
-            $outFile = "existing_patterns\steamui\$pattern"
-            try {
-              Write-Host "Downloading: $url"
-              Invoke-WebRequest -Uri $url -OutFile $outFile -TimeoutSec 10
-              if (Test-Path $outFile) {
-                Write-Host "Downloaded: $pattern"
-                break
-              }
-            } catch {
-              Write-Host "Failed to download $pattern : $_"
-            }
-          }
-          
-          # Create a combined function list from the downloaded patterns
-          $allFunctions = @{}
-          
-          # Parse steamclient patterns
-          $steamclientFiles = Get-ChildItem "existing_patterns\steamclient\*.toml" -ErrorAction SilentlyContinue
-          foreach ($file in $steamclientFiles) {
-            $content = Get-Content $file.FullName -Raw
-            
-            # Extract function names and signatures
-            $matches = [regex]::Matches($content, '\[(0x[0-9A-Fa-f]+)\]\s*\n\s*name\s*=\s*"([^"]+)"\s*\n\s*rva\s*=\s*"([^"]+)"\s*\n\s*sig\s*=\s*"([^"]+)"')
-            foreach ($match in $matches) {
-              $funcName = $match.Groups[2].Value
-              $sig = $match.Groups[4].Value
-              $allFunctions[$funcName] = @{
-                "component" = "steamclient"
-                "sig" = $sig
-              }
-            }
-          }
-          
-          # Parse steamui patterns
-          $steamuiFiles = Get-ChildItem "existing_patterns\steamui\*.toml" -ErrorAction SilentlyContinue
-          foreach ($file in $steamuiFiles) {
-            $content = Get-Content $file.FullName -Raw
-            
-            $matches = [regex]::Matches($content, '\[(0x[0-9A-Fa-f]+)\]\s*\n\s*name\s*=\s*"([^"]+)"\s*\n\s*rva\s*=\s*"([^"]+)"\s*\n\s*sig\s*=\s*"([^"]+)"')
-            foreach ($match in $matches) {
-              $funcName = $match.Groups[2].Value
-              $sig = $match.Groups[4].Value
-              $allFunctions[$funcName] = @{
-                "component" = "steamui"
-                "sig" = $sig
-              }
-            }
-          }
-          
-          # Save function list
-          $allFunctions | ConvertTo-Json -Depth 3 | Out-File "existing_patterns\functions.json" -Encoding UTF8
-          
-          Write-Host "Extracted $($allFunctions.Count) function signatures from steam-monitor"
-
       - name: Install Steam (Silent)
         run: |
           # Create installation directory
@@ -174,7 +78,8 @@ jobs:
             Get-ChildItem -Path $steamPath -ErrorAction SilentlyContinue | Select-Object Name
           }
 
-      - name: Extract DLL files
+      - name: Extract DLL files and compute hashes
+        id: extract
         run: |
           $steamPath = $env:STEAM_PATH
           $outputDir = "output"
@@ -188,6 +93,11 @@ jobs:
             if (Test-Path $src) {
               Copy-Item -Path $src -Destination $dst -Force
               Write-Host "Copied: $dll"
+              
+              # Compute SHA-256
+              $hash = (Get-FileHash -Path $dst -Algorithm SHA256).Hash.ToLower()
+              Write-Host "$dll SHA-256: $hash"
+              echo "${dll}_HASH=$hash" | Out-File -FilePath $env:GITHUB_ENV -Append
             } else {
               Write-Host "WARNING: $dll not found at $src"
             }
@@ -197,60 +107,85 @@ jobs:
           Write-Host "`nAll DLLs in Steam directory:"
           Get-ChildItem -Path $steamPath -Filter "*.dll" | Select-Object Name, Length
 
-      - name: Run Pattern Dumper (Enhanced)
+      - name: Check steam-monitor for existing patterns
         run: |
           $outputDir = "output"
+          New-Item -ItemType Directory -Force -Path "$outputDir\patterns"
           
-          # Build arguments
-          $args = @()
+          # Get SHA-256 hashes
+          $steamclientHash = $env:steamclient64.dll_HASH
+          $steamuiHash = $env:steamui.dll_HASH
           
-          if (Test-Path "$outputDir\steamclient64.dll") {
-            $args += "--steamclient-dll"
-            $args += "$outputDir\steamclient64.dll"
-          }
+          Write-Host "Checking steam-monitor for patterns..."
+          Write-Host "steamclient64.dll hash: $steamclientHash"
+          Write-Host "steamui.dll hash: $steamuiHash"
           
-          if (Test-Path "$outputDir\steamui.dll") {
-            $args += "--steamui-dll"
-            $args += "$outputDir\steamui.dll"
-          }
+          # Try to download pattern files from steam-monitor
+          $baseUri = "https://raw.githubusercontent.com/OpenSteam001/steam-monitor/pattern"
           
-          $args += "--output-dir"
-          $args += "$outputDir\patterns"
-          
-          $args += "--functions-json"
-          $args += "existing_patterns\functions.json"
-          
-          Write-Host "Running: python dump_patterns.py $($args -join ' ')"
-          python dump_patterns.py @args
-
-      - name: Generate Steam diagnostics
-        run: |
-          $steamPath = $env:STEAM_PATH
-          $outputDir = "output"
-          
-          # Get Steam version info
-          $steamExe = Join-Path $steamPath "steam.exe"
-          if (Test-Path $steamExe) {
-            $version = (Get-Item $steamExe).VersionInfo.FileVersion
-            Write-Host "Steam version: $version"
-            
-            # Save version info
-            @{
-              steam_path = $steamPath
-              steam_version = $version
-              timestamp = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
-            } | ConvertTo-Json | Out-File "$outputDir\patterns\steam_info.json"
-          }
-          
-          # Get DLL hashes
-          $dlls = @("steamclient64.dll", "steamui.dll")
-          foreach ($dll in $dlls) {
-            $path = Join-Path $outputDir $dll
-            if (Test-Path $path) {
-              $hash = (Get-FileHash -Path $path -Algorithm SHA256).Hash
-              Write-Host "$dll SHA-256: $hash"
+          # Check steamclient patterns
+          if ($steamclientHash) {
+            $url = "$baseUri/steamclient/$steamclientHash.toml"
+            $outFile = "$outputDir\patterns\steamclient_$steamclientHash.toml"
+            try {
+              Write-Host "Trying: $url"
+              $response = Invoke-WebRequest -Uri $url -OutFile $outFile -TimeoutSec 10 -ErrorAction Stop
+              Write-Host "SUCCESS: Found pattern for steamclient64.dll"
+            } catch {
+              Write-Host "Pattern not found in steam-monitor (HTTP $($_.Exception.Response.StatusCode.value__))"
+              
+              # Create empty pattern file as placeholder
+              @"
+# Pattern file for steamclient64.dll
+# SHA-256: $steamclientHash
+# Generated by OpenSteam Pattern Dumper
+# 
+# This Steam build is not yet in steam-monitor.
+# Manual pattern extraction required.
+"@ | Out-File $outFile -Encoding UTF8
             }
           }
+          
+          # Check steamui patterns
+          if ($steamuiHash) {
+            $url = "$baseUri/steamui/$steamuiHash.toml"
+            $outFile = "$outputDir\patterns\steamui_$steamuiHash.toml"
+            try {
+              Write-Host "Trying: $url"
+              $response = Invoke-WebRequest -Uri $url -OutFile $outFile -TimeoutSec 10 -ErrorAction Stop
+              Write-Host "SUCCESS: Found pattern for steamui.dll"
+            } catch {
+              Write-Host "Pattern not found in steam-monitor (HTTP $($_.Exception.Response.StatusCode.value__))"
+              
+              # Create empty pattern file as placeholder
+              @"
+# Pattern file for steamui.dll
+# SHA-256: $steamuiHash
+# Generated by OpenSteam Pattern Dumper
+# 
+# This Steam build is not yet in steam-monitor.
+# Manual pattern extraction required.
+"@ | Out-File $outFile -Encoding UTF8
+            }
+          }
+          
+          # Save Steam info
+          $steamPath = $env:STEAM_PATH
+          $steamExe = Join-Path $steamPath "steam.exe"
+          $version = "unknown"
+          if (Test-Path $steamExe) {
+            $version = (Get-Item $steamExe).VersionInfo.FileVersion
+          }
+          
+          @{
+            steam_path = $steamPath
+            steam_version = $version
+            steamclient_hash = $steamclientHash
+            steamui_hash = $steamuiHash
+            timestamp = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+          } | ConvertTo-Json | Out-File "$outputDir\patterns\steam_info.json"
+          
+          Write-Host "`nSteam info saved to steam_info.json"
 
       - name: Create output archive
         run: |
@@ -287,9 +222,11 @@ jobs:
           Write-Host "RESULTS SUMMARY"
           Write-Host "=========================================="
           
-          if (Test-Path "output\patterns\summary.json") {
-            $summary = Get-Content "output\patterns\summary.json" | ConvertFrom-Json
-            Write-Host ($summary | ConvertTo-Json -Depth 3)
+          if (Test-Path "output\patterns\steam_info.json") {
+            $info = Get-Content "output\patterns\steam_info.json" | ConvertFrom-Json
+            Write-Host "Steam Version: $($info.steam_version)"
+            Write-Host "steamclient64.dll SHA-256: $($info.steamclient_hash)"
+            Write-Host "steamui.dll SHA-256: $($info.steamui_hash)"
           }
           
           Write-Host "`nGenerated files:"
