@@ -1,9 +1,9 @@
-name: Dump Steam Patterns
+name: Steam Pattern Dumper
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 */6 * * *'  # Every 6 hours
+    - cron: '0 */6 * * *'
 
 jobs:
   dump-patterns:
@@ -24,19 +24,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install pefile requests
 
-      - name: Install Steam (Silent)
+      - name: Install Steam
         run: |
-          # Create installation directory
           $installDir = "C:\Steam"
           New-Item -ItemType Directory -Force -Path $installDir
-          
-          # Run Steam installer silently
           Start-Process -FilePath ".\SteamSetup.exe" -ArgumentList "/S" -Wait -NoNewWindow
-          
-          # Wait for installation to complete
           Start-Sleep -Seconds 30
           
-          # Find Steam installation
           $steamPaths = @(
             "C:\Program Files (x86)\Steam",
             "C:\Program Files\Steam",
@@ -53,7 +47,6 @@ jobs:
           }
           
           if (-not $steamPath) {
-            # Try to find it
             $steamPath = Get-ChildItem -Path "C:\" -Filter "steam.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty DirectoryName
           }
           
@@ -61,115 +54,85 @@ jobs:
             echo "STEAM_PATH=$steamPath" | Out-File -FilePath $env:GITHUB_ENV -Append
             Write-Host "Steam found at: $steamPath"
           } else {
-            Write-Host "WARNING: Steam.exe not found, will try common paths"
             echo "STEAM_PATH=C:\Program Files (x86)\Steam" | Out-File -FilePath $env:GITHUB_ENV -Append
           }
 
-      - name: Wait for Steam to initialize
+      - name: Wait for Steam
         run: |
-          # Give Steam time to create necessary files
           Start-Sleep -Seconds 15
-          
           $steamPath = $env:STEAM_PATH
           if (Test-Path "$steamPath\steamclient64.dll") {
             Write-Host "steamclient64.dll found"
           } else {
-            Write-Host "steamclient64.dll not found, listing directory contents:"
+            Write-Host "steamclient64.dll not found"
             Get-ChildItem -Path $steamPath -ErrorAction SilentlyContinue | Select-Object Name
           }
 
-      - name: Extract DLL files and compute hashes
-        id: extract
+      - name: Extract DLLs
         run: |
           $steamPath = $env:STEAM_PATH
           $outputDir = "output"
           New-Item -ItemType Directory -Force -Path $outputDir
           
-          # Copy DLLs
           $dlls = @("steamclient64.dll", "steamui.dll")
           foreach ($dll in $dlls) {
             $src = Join-Path $steamPath $dll
             $dst = Join-Path $outputDir $dll
             if (Test-Path $src) {
               Copy-Item -Path $src -Destination $dst -Force
-              Write-Host "Copied: $dll"
-              
-              # Compute SHA-256
               $hash = (Get-FileHash -Path $dst -Algorithm SHA256).Hash.ToLower()
               Write-Host "$dll SHA-256: $hash"
               echo "${dll}_HASH=$hash" | Out-File -FilePath $env:GITHUB_ENV -Append
             } else {
-              Write-Host "WARNING: $dll not found at $src"
+              Write-Host "WARNING: $dll not found"
             }
           }
-          
-          # List all DLLs for debugging
-          Write-Host "`nAll DLLs in Steam directory:"
-          Get-ChildItem -Path $steamPath -Filter "*.dll" | Select-Object Name, Length
 
-      - name: Check steam-monitor for existing patterns
+      - name: Download patterns from steam-monitor
         run: |
           $outputDir = "output"
           New-Item -ItemType Directory -Force -Path "$outputDir\patterns"
           
-          # Get SHA-256 hashes
           $steamclientHash = $env:steamclient64.dll_HASH
           $steamuiHash = $env:steamui.dll_HASH
           
-          Write-Host "Checking steam-monitor for patterns..."
-          Write-Host "steamclient64.dll hash: $steamclientHash"
-          Write-Host "steamui.dll hash: $steamuiHash"
-          
-          # Try to download pattern files from steam-monitor
           $baseUri = "https://raw.githubusercontent.com/OpenSteam001/steam-monitor/pattern"
           
-          # Check steamclient patterns
+          # Check steamclient
           if ($steamclientHash) {
             $url = "$baseUri/steamclient/$steamclientHash.toml"
             $outFile = "$outputDir\patterns\steamclient_$steamclientHash.toml"
             try {
-              Write-Host "Trying: $url"
-              $response = Invoke-WebRequest -Uri $url -OutFile $outFile -TimeoutSec 10 -ErrorAction Stop
-              Write-Host "SUCCESS: Found pattern for steamclient64.dll"
+              Invoke-WebRequest -Uri $url -OutFile $outFile -TimeoutSec 10 -ErrorAction Stop
+              Write-Host "SUCCESS: Found steamclient pattern"
             } catch {
-              Write-Host "Pattern not found in steam-monitor (HTTP $($_.Exception.Response.StatusCode.value__))"
-              
-              # Create empty pattern file as placeholder
+              Write-Host "Pattern not found for steamclient"
               @"
-# Pattern file for steamclient64.dll
+# steamclient64.dll pattern
 # SHA-256: $steamclientHash
-# Generated by OpenSteam Pattern Dumper
-# 
-# This Steam build is not yet in steam-monitor.
-# Manual pattern extraction required.
+# Not yet in steam-monitor - manual extraction needed
 "@ | Out-File $outFile -Encoding UTF8
             }
           }
           
-          # Check steamui patterns
+          # Check steamui
           if ($steamuiHash) {
             $url = "$baseUri/steamui/$steamuiHash.toml"
             $outFile = "$outputDir\patterns\steamui_$steamuiHash.toml"
             try {
-              Write-Host "Trying: $url"
-              $response = Invoke-WebRequest -Uri $url -OutFile $outFile -TimeoutSec 10 -ErrorAction Stop
-              Write-Host "SUCCESS: Found pattern for steamui.dll"
+              Invoke-WebRequest -Uri $url -OutFile $outFile -TimeoutSec 10 -ErrorAction Stop
+              Write-Host "SUCCESS: Found steamui pattern"
             } catch {
-              Write-Host "Pattern not found in steam-monitor (HTTP $($_.Exception.Response.StatusCode.value__))"
-              
-              # Create empty pattern file as placeholder
+              Write-Host "Pattern not found for steamui"
               @"
-# Pattern file for steamui.dll
+# steamui.dll pattern
 # SHA-256: $steamuiHash
-# Generated by OpenSteam Pattern Dumper
-# 
-# This Steam build is not yet in steam-monitor.
-# Manual pattern extraction required.
+# Not yet in steam-monitor - manual extraction needed
 "@ | Out-File $outFile -Encoding UTF8
             }
           }
           
-          # Save Steam info
+          # Save info
           $steamPath = $env:STEAM_PATH
           $steamExe = Join-Path $steamPath "steam.exe"
           $version = "unknown"
@@ -178,60 +141,35 @@ jobs:
           }
           
           @{
-            steam_path = $steamPath
             steam_version = $version
             steamclient_hash = $steamclientHash
             steamui_hash = $steamuiHash
             timestamp = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
           } | ConvertTo-Json | Out-File "$outputDir\patterns\steam_info.json"
-          
-          Write-Host "`nSteam info saved to steam_info.json"
 
-      - name: Create output archive
+      - name: Create archive
         run: |
           $outputDir = "output\patterns"
           $archiveName = "steam-patterns-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
-          
-          # Create ZIP archive
           Compress-Archive -Path "$outputDir\*" -DestinationPath "$archiveName.zip" -Force
-          
-          Write-Host "Created archive: $archiveName.zip"
-          $archiveSize = (Get-Item "$archiveName.zip").Length / 1MB
-          Write-Host "Archive size: $([math]::Round($archiveSize, 2)) MB"
+          Write-Host "Created: $archiveName.zip"
 
-      - name: Upload pattern artifacts
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: steam-patterns-${{ github.run_number }}
-          path: |
-            output/patterns/*.toml
-            output/patterns/*.json
+          path: output/patterns/*
           retention-days: 30
 
-      - name: Upload archive artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: steam-patterns-archive-${{ github.run_number }}
-          path: "*.zip"
-          retention-days: 30
-
-      - name: Print results summary
+      - name: Summary
         if: always()
         run: |
-          Write-Host "`n=========================================="
-          Write-Host "RESULTS SUMMARY"
-          Write-Host "=========================================="
-          
           if (Test-Path "output\patterns\steam_info.json") {
             $info = Get-Content "output\patterns\steam_info.json" | ConvertFrom-Json
-            Write-Host "Steam Version: $($info.steam_version)"
-            Write-Host "steamclient64.dll SHA-256: $($info.steamclient_hash)"
-            Write-Host "steamui.dll SHA-256: $($info.steamui_hash)"
+            Write-Host "Steam: $($info.steam_version)"
+            Write-Host "steamclient64.dll: $($info.steamclient_hash)"
+            Write-Host "steamui.dll: $($info.steamui_hash)"
           }
-          
-          Write-Host "`nGenerated files:"
-          if (Test-Path "output\patterns") {
-            Get-ChildItem "output\patterns" | ForEach-Object {
-              Write-Host "  $($_.Name) ($([math]::Round($_.Length / 1KB, 2)) KB)"
-            }
+          Get-ChildItem "output\patterns" -ErrorAction SilentlyContinue | ForEach-Object {
+            Write-Host "  $($_.Name) ($([math]::Round($_.Length / 1KB, 2)) KB)"
           }
