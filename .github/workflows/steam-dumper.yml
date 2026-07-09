@@ -98,7 +98,6 @@ jobs:
           
           $baseUri = "https://raw.githubusercontent.com/OpenSteam001/steam-monitor/pattern"
           
-          # Check steamclient
           if ($steamclientHash) {
             $url = "$baseUri/steamclient/$steamclientHash.toml"
             $outFile = "$outputDir\patterns\steamclient_$steamclientHash.toml"
@@ -107,15 +106,10 @@ jobs:
               Write-Host "SUCCESS: Found steamclient pattern"
             } catch {
               Write-Host "Pattern not found for steamclient"
-              @"
-# steamclient64.dll pattern
-# SHA-256: $steamclientHash
-# Not yet in steam-monitor - manual extraction needed
-"@ | Out-File $outFile -Encoding UTF8
+              Set-Content -Path $outFile -Value "# steamclient64.dll SHA-256: $steamclientHash - not in steam-monitor"
             }
           }
           
-          # Check steamui
           if ($steamuiHash) {
             $url = "$baseUri/steamui/$steamuiHash.toml"
             $outFile = "$outputDir\patterns\steamui_$steamuiHash.toml"
@@ -124,15 +118,10 @@ jobs:
               Write-Host "SUCCESS: Found steamui pattern"
             } catch {
               Write-Host "Pattern not found for steamui"
-              @"
-# steamui.dll pattern
-# SHA-256: $steamuiHash
-# Not yet in steam-monitor - manual extraction needed
-"@ | Out-File $outFile -Encoding UTF8
+              Set-Content -Path $outFile -Value "# steamui.dll SHA-256: $steamuiHash - not in steam-monitor"
             }
           }
           
-          # Save info
           $steamPath = $env:STEAM_PATH
           $steamExe = Join-Path $steamPath "steam.exe"
           $version = "unknown"
@@ -140,12 +129,13 @@ jobs:
             $version = (Get-Item $steamExe).VersionInfo.FileVersion
           }
           
-          @{
+          $info = @{
             steam_version = $version
             steamclient_hash = $steamclientHash
             steamui_hash = $steamuiHash
             timestamp = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
-          } | ConvertTo-Json | Out-File "$outputDir\patterns\steam_info.json"
+          }
+          $info | ConvertTo-Json | Out-File "$outputDir\patterns\steam_info.json"
 
       - name: Create archive
         run: |
