@@ -140,31 +140,7 @@ jobs:
 
       - name: Build comprehensive function list
         run: |
-          python -c "import json; print('Building comprehensive function list...')"
-          python tools/merge_patterns.py --patterns-dir patterns_ref --output output/merged_reference.json
-          
-          python -c "
-import json, os
-
-merged = {}
-if os.path.exists('output/merged_reference.json'):
-    with open('output/merged_reference.json') as f:
-        merged = json.load(f)
-
-for comp in ['steamclient', 'steamui']:
-    exports_file = f'output/exports_{comp}.json'
-    if os.path.exists(exports_file):
-        with open(exports_file) as f:
-            exports = json.load(f)
-        for name, info in exports.items():
-            if name not in merged:
-                merged[name] = {'sig': info['sig']}
-
-with open('output/all_functions.json', 'w') as f:
-    json.dump(merged, f, indent=2)
-
-print(f'Total functions: {len(merged)}')
-"
+          python tools/build_function_list.py --patterns-dir patterns_ref --exports-dir output --output output/all_functions.json
 
       - name: Scan steamclient64.dll with ALL functions
         run: |
