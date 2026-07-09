@@ -22,7 +22,51 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pefile
+          pip install pefile requests
+
+      - name: Download existing patterns from steam-monitor
+        run: |
+          # Create directories for existing patterns
+          New-Item -ItemType Directory -Force -Path "existing_patterns\steamclient"
+          New-Item -ItemType Directory -Force -Path "existing_patterns\steamui"
+          
+          # Download all pattern files from steam-monitor
+          # First, get the list of files in the pattern branch
+          $baseUri = "https://raw.githubusercontent.com/OpenSteam001/steam-monitor/pattern"
+          
+          # Known function names to track (from OpenSteamTool)
+          $steamclientFunctions = @(
+            "CheckAppOwnership", "ConfigStoreGetBinary", "BuildDepotDependency",
+            "IPCProcessMessage", "BBuildAndAsyncSendFrame", "RecvPkt",
+            "SendCallbackToPipe", "SpawnProcess", "GetPackageInfo",
+            "MarkLicenseAsChanged", "ProcessPendingLicenseUpdates",
+            "GetPipeClient", "GetAppDataFromAppInfo", "GetAppIDForCurrentPipe",
+            "OptedInMask", "BuildSpawnEnvBlock", "PchMsgNameFromEMsg",
+            "CUtlBufferEnsureCapacity", "CUtlMemoryGrow", "GetOrAddAppData",
+            "LoadDepotDecryptionKey", "LoadPackage", "KeyValues_ReadAsBinary",
+            "KeyValues_FindOrCreateKey", "CloseAppCloud", "AddProtobufAsBinary"
+          )
+          
+          $steamuiFunctions = @(
+            "FillInAppOverview", "BuildCompleteAppOverviewChange",
+            "CSteamUIAppControllerRunFrame", "GetAppByID", "MarkAppChange",
+            "RepeatedFieldUint32_Add", "ShouldShowAppInLibrary",
+            "AddProtobufAsBinary", "GetTopManager", "LoadModuleWithPath"
+          )
+          
+          # Create a combined function list JSON for the scanner
+          $allFunctions = @{}
+          foreach ($func in $steamclientFunctions) {
+            $allFunctions[$func] = @{"component" = "steamclient"}
+          }
+          foreach ($func in $steamuiFunctions) {
+            $allFunctions[$func] = @{"component" = "steamui"}
+          }
+          
+          # Save function list
+          $allFunctions | ConvertTo-Json | Out-File "existing_patterns\functions.json" -Encoding UTF8
+          
+          Write-Host "Created function list with $($allFunctions.Count) functions"
 
       - name: Install Steam (Silent)
         run: |
@@ -31,7 +75,6 @@ jobs:
           New-Item -ItemType Directory -Force -Path $installDir
           
           # Run Steam installer silently
-          # /S = silent, /D = install directory
           Start-Process -FilePath ".\SteamSetup.exe" -ArgumentList "/S" -Wait -NoNewWindow
           
           # Wait for installation to complete
@@ -80,7 +123,6 @@ jobs:
           }
 
       - name: Extract DLL files
-        id: extract
         run: |
           $steamPath = $env:STEAM_PATH
           $outputDir = "output"
@@ -103,9 +145,8 @@ jobs:
           Write-Host "`nAll DLLs in Steam directory:"
           Get-ChildItem -Path $steamPath -Filter "*.dll" | Select-Object Name, Length
 
-      - name: Run Pattern Dumper
+      - name: Run Pattern Dumper (Enhanced)
         run: |
-          $steamPath = $env:STEAM_PATH
           $outputDir = "output"
           
           # Build arguments
@@ -123,6 +164,9 @@ jobs:
           
           $args += "--output-dir"
           $args += "$outputDir\patterns"
+          
+          $args += "--functions-json"
+          $args += "existing_patterns\functions.json"
           
           Write-Host "Running: python dump_patterns.py $($args -join ' ')"
           python dump_patterns.py @args
