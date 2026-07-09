@@ -24,6 +24,56 @@ jobs:
           python -m pip install --upgrade pip
           pip install pefile requests
 
+      - name: Download all reference patterns from steam-monitor
+        run: |
+          python tools/download_patterns.py --output-dir patterns_ref --token ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Merge reference patterns
+        run: |
+          python -c "
+          import os, json, re, glob
+          
+          def load_patterns_from_toml(path):
+              functions = {}
+              if not os.path.exists(path):
+                  return functions
+              current_entry = {}
+              with open(path, 'r') as f:
+                  for line in f:
+                      line = line.strip()
+                      if not line or line.startswith('#'):
+                          continue
+                      m = re.match(r'^\[[0-9A-Fa-fx]+\]$', line)
+                      if m:
+                          if current_entry.get('name') and current_entry.get('sig'):
+                              functions[current_entry['name']] = {'sig': current_entry['sig']}
+                          current_entry = {}
+                          continue
+                      kv = re.match(r'^(\w+)\s*=\s*\"(.*)\"$', line)
+                      if kv:
+                          current_entry[kv.group(1)] = kv.group(2)
+              if current_entry.get('name') and current_entry.get('sig'):
+                  functions[current_entry['name']] = {'sig': current_entry['sig']}
+              return functions
+          
+          all_funcs = {}
+          for comp in ['steamclient', 'steamui']:
+              pattern_dir = f'patterns_ref/{comp}'
+              if not os.path.isdir(pattern_dir):
+                  continue
+              for f in sorted(glob.glob(os.path.join(pattern_dir, '*.toml'))):
+                  funcs = load_patterns_from_toml(f)
+                  for name, info in funcs.items():
+                      if name not in all_funcs:
+                          all_funcs[name] = info
+          
+          os.makedirs('output', exist_ok=True)
+          with open('output/merged_reference.json', 'w') as f:
+              json.dump(all_funcs, f, indent=2)
+          
+          print(f'Merged {len(all_funcs)} unique functions from all patterns')
+          "
+
       - name: Install and run Steam to download files
         run: |
           $installDir = "C:\Steam"
@@ -33,7 +83,6 @@ jobs:
           Start-Process -FilePath ".\SteamSetup.exe" -ArgumentList "/S" -Wait -NoNewWindow
           Start-Sleep -Seconds 10
           
-          # Find Steam installation
           $steamPath = $null
           $possiblePaths = @(
             "C:\Program Files (x86)\Steam",
@@ -62,15 +111,11 @@ jobs:
           echo "STEAM_PATH=$steamPath" | Out-File -FilePath $env:GITHUB_ENV -Append
           Write-Host "Steam path: $steamPath"
           
-          # Run Steam.exe to download client files
           $steamExe = Join-Path $steamPath "steam.exe"
           if (Test-Path $steamExe) {
             Write-Host "=== Running Steam to download client files ==="
-            
-            # Start Steam with various flags to force download
             Start-Process -FilePath $steamExe -ArgumentList "-no-browser -nochatui -silent" -ErrorAction SilentlyContinue
             
-            # Wait for DLLs to appear (check every 5 seconds for 2 minutes)
             $maxWait = 120
             $elapsed = 0
             $dllsFound = @()
@@ -79,13 +124,11 @@ jobs:
               Start-Sleep -Seconds 5
               $elapsed += 5
               
-              # Check for DLLs
-              $targetDlls = @("steamclient64.dll", "steamui.dll")
-              foreach ($dll in $targetDlls) {
+              foreach ($dll in @("steamclient64.dll", "steamui.dll")) {
                 $dllPath = Join-Path $steamPath $dll
                 if (Test-Path $dllPath) {
                   $size = (Get-Item $dllPath).Length
-                  if ($size -gt 1000000) {  # At least 1MB
+                  if ($size -gt 1000000) {
                     Write-Host "  FOUND: $dll ($([math]::Round($size/1MB, 2)) MB)"
                     $dllsFound += $dll
                   }
@@ -96,48 +139,44 @@ jobs:
                 Write-Host "All DLLs found!"
                 break
               }
-              
               Write-Host "  Waiting... ($elapsed/$maxWait sec) - Found: $($dllsFound.Count)/2"
             }
             
-            # Kill Steam
             Write-Host "=== Killing Steam ==="
             Get-Process -Name "steam" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
             Get-Process -Name "steamwebhelper" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-            Get-Process -Name "steam_oOo..." -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
             Start-Sleep -Seconds 3
             
-            # Final check
             Write-Host "=== Final DLL check ==="
             Get-ChildItem -Path $steamPath -Filter "*.dll" | ForEach-Object {
               Write-Host "  $($_.Name) - $([math]::Round($_.Length/1KB, 2)) KB"
             }
           }
 
-      - name: Extract DLLs
+      - name: Extract DLLs and compute hashes
         run: |
           $steamPath = $env:STEAM_PATH
           $outputDir = "output"
           New-Item -ItemType Directory -Force -Path $outputDir
           
-          $dlls = @("steamclient64.dll", "steamui.dll")
-          foreach ($dll in $dlls) {
+          foreach ($dll in @("steamclient64.dll", "steamui.dll")) {
             $src = Join-Path $steamPath $dll
             $dst = Join-Path $outputDir $dll
             if (Test-Path $src) {
               Copy-Item -Path $src -Destination $dst -Force
               $hash = (Get-FileHash -Path $dst -Algorithm SHA256).Hash.ToLower()
               Write-Host "$dll SHA-256: $hash"
-              echo "HASH_$($dll.Replace('.dll','').Replace('64',''))=$hash" | Out-File -FilePath $env:GITHUB_ENV -Append
+              $envVar = "HASH_" + $dll.Replace(".dll","").Replace("64","")
+              echo "$envVar=$hash" | Out-File -FilePath $env:GITHUB_ENV -Append
             } else {
               Write-Host "$dll NOT FOUND"
             }
           }
 
-      - name: Download patterns from steam-monitor
+      - name: Download matching patterns from steam-monitor
         run: |
           $outputDir = "output"
-          New-Item -ItemType Directory -Force -Path "$outputDir\patterns"
+          New-Item -ItemType Directory -Force -Path "$outputDir\patterns_match"
           
           $steamclientHash = $env:HASH_steamclient
           $steamuiHash = $env:HASH_steamui
@@ -147,31 +186,23 @@ jobs:
           
           $baseUri = "https://raw.githubusercontent.com/OpenSteam001/steam-monitor/pattern"
           
-          if ($steamclientHash) {
-            $url = "$baseUri/steamclient/$steamclientHash.toml"
-            $outFile = "$outputDir\patterns\steamclient_$steamclientHash.toml"
-            try {
-              Invoke-WebRequest -Uri $url -OutFile $outFile -TimeoutSec 10 -ErrorAction Stop
-              Write-Host "SUCCESS: Found steamclient pattern"
-            } catch {
-              Write-Host "Pattern not found for steamclient"
-              Set-Content -Path $outFile -Value "# SHA-256: $steamclientHash - not in steam-monitor"
+          foreach ($comp in @("steamclient", "steamui")) {
+            $hashVar = "HASH_" + $comp
+            $hash = [Environment]::GetEnvironmentVariable($hashVar)
+            if ($hash) {
+              $url = "$baseUri/$comp/$hash.toml"
+              $outFile = "$outputDir\patterns_match\${comp}_${hash}.toml"
+              try {
+                Invoke-WebRequest -Uri $url -OutFile $outFile -TimeoutSec 15 -ErrorAction Stop
+                $size = (Get-Item $outFile).Length
+                Write-Host "SUCCESS: Found $comp pattern ($size bytes)"
+              } catch {
+                Write-Host "Pattern not found for $comp"
+                Set-Content -Path $outFile -Value "# SHA-256: $hash - not in steam-monitor"
+              }
             }
           }
           
-          if ($steamuiHash) {
-            $url = "$baseUri/steamui/$steamuiHash.toml"
-            $outFile = "$outputDir\patterns\steamui_$steamuiHash.toml"
-            try {
-              Invoke-WebRequest -Uri $url -OutFile $outFile -TimeoutSec 10 -ErrorAction Stop
-              Write-Host "SUCCESS: Found steamui pattern"
-            } catch {
-              Write-Host "Pattern not found for steamui"
-              Set-Content -Path $outFile -Value "# SHA-256: $steamuiHash - not in steam-monitor"
-            }
-          }
-          
-          # Save info
           $steamPath = $env:STEAM_PATH
           $version = "unknown"
           $steamExe = Join-Path $steamPath "steam.exe"
@@ -186,38 +217,33 @@ jobs:
             timestamp = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
           } | ConvertTo-Json | Out-File "$outputDir\steam_info.json"
 
-      - name: Scan DLLs for patterns
+      - name: Scan DLLs with ALL merged reference patterns
         run: |
           $outputDir = "output"
           
-          Write-Host "=== Running pattern scanner ==="
+          Write-Host "=== Scanning steamclient64.dll ==="
+          python tools/sig_scanner.py `
+            --dll "$outputDir\steamclient64.dll" `
+            --component steamclient `
+            --output "$outputDir\steamclient64.toml" `
+            --functions-json "$outputDir\merged_reference.json"
           
-          # Scan steamclient64.dll
-          $clientDll = "$outputDir\steamclient64.dll"
-          if (Test-Path $clientDll) {
-            Write-Host "Scanning steamclient64.dll..."
-            python tools/sig_scanner.py --dll $clientDll --component steamclient --output "$outputDir\steamclient64.toml"
-          }
-          
-          # Scan steamui.dll
-          $uiDll = "$outputDir\steamui.dll"
-          if (Test-Path $uiDll) {
-            Write-Host "Scanning steamui.dll..."
-            python tools/sig_scanner.py --dll $uiDll --component steamui --output "$outputDir\steamui.toml"
-          }
-          
-          # Extract IPC vtables
-          Write-Host "=== Running IPC extractor ==="
-          python tools/ipc_extractor.py --dll "$outputDir\steamclient64.dll" --output "$outputDir\ipc_vtables.toml"
+          Write-Host ""
+          Write-Host "=== Scanning steamui.dll ==="
+          python tools/sig_scanner.py `
+            --dll "$outputDir\steamui.dll" `
+            --component steamui `
+            --output "$outputDir\steamui.toml" `
+            --functions-json "$outputDir\merged_reference.json"
 
-      - name: Create archive
+      - name: Extract IPC vtable layouts
         run: |
           $outputDir = "output"
-          if (Test-Path $outputDir) {
-            $archiveName = "steam-patterns-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
-            Compress-Archive -Path "$outputDir\*" -DestinationPath "$archiveName.zip" -Force
-            Write-Host "Created: $archiveName.zip"
-          }
+          Write-Host "=== Extracting IPC vtables ==="
+          python tools/ipc_extractor.py `
+            --dll "$outputDir\steamclient64.dll" `
+            --output "$outputDir\ipc_vtables.toml" `
+            --pattern-toml "$outputDir\steamclient64.toml"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -233,9 +259,20 @@ jobs:
           if (Test-Path "output\steam_info.json") {
             $info = Get-Content "output\steam_info.json" | ConvertFrom-Json
             Write-Host "Steam: $($info.steam_version)"
-            Write-Host "steamclient: $($info.steamclient_hash)"
-            Write-Host "steamui: $($info.steamui_hash)"
+            Write-Host "steamclient hash: $($info.steamclient_hash)"
+            Write-Host "steamui hash: $($info.steamui_hash)"
           }
+          Write-Host ""
+          Write-Host "Output files:"
           Get-ChildItem "output" -ErrorAction SilentlyContinue | ForEach-Object {
             Write-Host "  $($_.Name) ($([math]::Round($_.Length / 1KB, 2)) KB)"
+          }
+          
+          if (Test-Path "output\steamclient64.toml") {
+            $count = (Get-Content "output\steamclient64.toml" | Select-String "^\[" | Measure-Object).Count
+            Write-Host "`nsteamclient64 patterns: $count"
+          }
+          if (Test-Path "output\steamui.toml") {
+            $count = (Get-Content "output\steamui.toml" | Select-String "^\[" | Measure-Object).Count
+            Write-Host "steamui patterns: $count"
           }

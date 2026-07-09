@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-OpenSteam Pattern Dumper - IPC Extractor
-Extracts IPC interface vtable layouts from Steam DLLs.
+OpenSteam Pattern Dumper - IPC Extractor v2
+Extracts IPC interface vtable layouts from Steam client DLLs.
 """
 
 import os
@@ -11,8 +11,7 @@ import struct
 import re
 import json
 import argparse
-from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Optional
 
 try:
     import pefile
@@ -21,16 +20,7 @@ except ImportError:
     import pefile
 
 
-def compute_sha256(filepath: str) -> str:
-    sha256 = hashlib.sha256()
-    with open(filepath, "rb") as f:
-        for chunk in iter(lambda: f.read(65536), b""):
-            sha256.update(chunk)
-    return sha256.hexdigest()
-
-
 def compute_name_hash(name: str) -> int:
-    """FNV-1a 32-bit hash."""
     hash_val = 0x811C9DC5
     for byte in name.encode("utf-8"):
         hash_val ^= byte
@@ -38,12 +28,35 @@ def compute_name_hash(name: str) -> int:
     return hash_val
 
 
+def load_patterns_from_toml(toml_path: str) -> Dict[str, dict]:
+    patterns = {}
+    if not os.path.exists(toml_path):
+        return patterns
+    current_entry = {}
+    current_hash = None
+    with open(toml_path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            m = re.match(r"^\[([0-9A-Fa-fx]+)\]$", line)
+            if m:
+                if current_hash and current_entry:
+                    patterns[current_hash] = current_entry
+                current_hash = m.group(1)
+                current_entry = {}
+                continue
+            kv = re.match(r'^(\w+)\s*=\s*"(.*)"$', line)
+            if kv:
+                current_entry[kv.group(1)] = kv.group(2)
+    if current_hash and current_entry:
+        patterns[current_hash] = current_entry
+    return patterns
+
+
 def find_string_in_pe(pe: pefile.PE, search_string: str) -> List[int]:
-    """Find all occurrences of a string in the PE's data directories and sections."""
     results = []
     search_bytes = search_string.encode("utf-8")
-
-    # Search in all sections
     for section in pe.sections:
         data = section.get_data()
         offset = 0
@@ -51,7 +64,6 @@ def find_string_in_pe(pe: pefile.PE, search_string: str) -> List[int]:
             idx = data.find(search_bytes, offset)
             if idx == -1:
                 break
-            # Convert to RVA
             file_offset = section.PointerToRawData + idx
             try:
                 rva = pe.get_rva_from_offset(file_offset)
@@ -59,139 +71,162 @@ def find_string_in_pe(pe: pefile.PE, search_string: str) -> List[int]:
             except Exception:
                 pass
             offset = idx + 1
-
     return results
 
 
-def find_vtable_pattern(pe: pefile.PE, interface_name: str) -> Optional[dict]:
-    """
-    Attempt to find a vtable for an IPC interface.
-    This is a heuristic approach - looks for patterns typical of vtable construction.
-    """
-    # Known IPC interface names from steam-monitor
-    ipc_interfaces = {
-        "IClientUser": {"interface_id": 0},
-        "IClientUtils": {"interface_id": 1},
-        "IClientApps": {"interface_id": 2},
-        "IClientShortcuts": {"interface_id": 3},
-        "IClientNetworking": {"interface_id": 4},
-        "IClientRemoteStorage": {"interface_id": 5},
-        "IClientScreenshots": {"interface_id": 6},
-        "IClientHTTP": {"interface_id": 7},
-        "IClientUnifiedMessages": {"interface_id": 8},
-        "IClientController": {"interface_id": 9},
-        "IClientAppDisableUpdate": {"interface_id": 10},
-        "IClientParentalSettings": {"interface_id": 11},
-        "IClientSteamHelper": {"interface_id": 12},
-        "IClientDepotBuilder": {"interface_id": 13},
-        "IClientConfigStore": {"interface_id": 14},
-        "IClientUserStats": {"interface_id": 15},
-        "IClientNetworkingSockets": {"interface_id": 16},
-        "IClientRemoteClientManager": {"interface_id": 17},
-        "IClientStreamingClient": {"interface_id": 18},
-        "IClientRemoteControlManager": {"interface_id": 19},
-        "IClientControllerSerialized": {"interface_id": 20},
-        "IClientBrowser": {"interface_id": 21},
-        "IClientVideo": {"interface_id": 22},
-        "IClientVirtualController": {"interface_id": 23},
-        "IClientParties": {"interface_id": 24},
-        "IClientNetworkingUtils": {"interface_id": 25},
-        "IClientNetworkingMessages": {"interface_id": 26},
-        "IClientNetworkingSocketsSerialized": {"interface_id": 27},
-        "IClientAppCache": {"interface_id": 28},
-        "IClientNetworkingSocketsTools": {"interface_id": 29},
-    }
-
-    if interface_name not in ipc_interfaces:
-        return None
-
-    info = ipc_interfaces[interface_name]
-
-    # Look for the interface name string in the binary
-    string_rvas = find_string_in_pe(pe, interface_name)
-    if not string_rvas:
-        return None
-
-    # For each string reference, try to find nearby vtable patterns
-    # A vtable is typically an array of function pointers (64-bit pointers on x64)
-    # preceded by a type_info pointer
-
-    for string_rva in string_rvas:
-        # Get the code section containing this RVA
-        containing_section = None
-        for section in pe.sections:
-            if (section.VirtualAddress <= string_rva <
-                section.VirtualAddress + section.Misc_VirtualSize):
-                containing_section = section
-                break
-
-        if not containing_section:
+def find_string_in_pe_data(pe: pefile.PE, search_string: str) -> List[int]:
+    """Find string only in data sections (.rdata, .data)."""
+    results = []
+    search_bytes = search_string.encode("utf-8")
+    for section in pe.sections:
+        name = section.Name.rstrip(b"\x00").decode(errors="ignore")
+        if name in (".text", ".code"):
             continue
-
-        # Read data around the string reference
-        section_data = containing_section.get_data()
-        section_offset = string_rva - containing_section.VirtualAddress
-
-        # Look for RIP-relative LEA instructions that reference this string
-        # Pattern: 48 8D 0D xx xx xx xx (LEA RCX, [RIP+disp32])
-        for i in range(max(0, section_offset - 0x1000),
-                       min(len(section_data) - 7, section_offset + 0x1000)):
-            # Check for LEA RCX/RDX/R8/R9, [RIP+disp32]
-            if section_data[i] in (0x48, 0x4C):
-                if section_data[i+1] == 0x8D:
-                    modrm = section_data[i+2]
-                    if (modrm & 0xC7) == 0x05:  # RIP-relative addressing
-                        reg = (modrm >> 3) & 7
-                        if reg in (0, 1, 2, 3):  # RCX, RDX, R8, R9
-                            disp = struct.unpack_from("<i", section_data, i+3)[0]
-                            target_rva = string_rva
-                            ref_rva = containing_section.VirtualAddress + i
-
-                            # Check if this LEA references our string
-                            if ref_rva + 7 + disp == target_rva:
-                                # Found a reference to the interface name
-                                # Now look backward for vtable setup patterns
-                                pass
-
-    return None
+        data = section.get_data()
+        offset = 0
+        while True:
+            idx = data.find(search_bytes, offset)
+            if idx == -1:
+                break
+            file_offset = section.PointerToRawData + idx
+            try:
+                rva = pe.get_rva_from_offset(file_offset)
+                results.append(rva)
+            except Exception:
+                pass
+            offset = idx + 1
+    return results
 
 
-def extract_ipc_from_pattern_file(patterns: Dict[str, dict]) -> Dict[str, dict]:
-    """
-    Extract IPC information from existing pattern TOML patterns.
-    This provides a baseline using known function names.
-    """
+# IPC interface definitions matching OpenSteamTool
+IPC_INTERFACES = {
+    "IClientUser": {"interface_id": 0, "methods": {}},
+    "IClientUtils": {"interface_id": 1, "methods": {}},
+    "IClientApps": {"interface_id": 2, "methods": {}},
+    "IClientShortcuts": {"interface_id": 3, "methods": {}},
+    "IClientNetworking": {"interface_id": 4, "methods": {}},
+    "IClientRemoteStorage": {"interface_id": 5, "methods": {}},
+    "IClientScreenshots": {"interface_id": 6, "methods": {}},
+    "IClientHTTP": {"interface_id": 7, "methods": {}},
+    "IClientUnifiedMessages": {"interface_id": 8, "methods": {}},
+    "IClientController": {"interface_id": 9, "methods": {}},
+    "IClientAppDisableUpdate": {"interface_id": 10, "methods": {}},
+    "IClientParentalSettings": {"interface_id": 11, "methods": {}},
+    "IClientSteamHelper": {"interface_id": 12, "methods": {}},
+    "IClientDepotBuilder": {"interface_id": 13, "methods": {}},
+    "IClientConfigStore": {"interface_id": 14, "methods": {}},
+    "IClientUserStats": {"interface_id": 15, "methods": {}},
+    "IClientNetworkingSockets": {"interface_id": 16, "methods": {}},
+    "IClientRemoteClientManager": {"interface_id": 17, "methods": {}},
+    "IClientStreamingClient": {"interface_id": 18, "methods": {}},
+    "IClientRemoteControlManager": {"interface_id": 19, "methods": {}},
+    "IClientControllerSerialized": {"interface_id": 20, "methods": {}},
+    "IClientBrowser": {"interface_id": 21, "methods": {}},
+    "IClientVideo": {"interface_id": 22, "methods": {}},
+    "IClientVirtualController": {"interface_id": 23, "methods": {}},
+    "IClientParties": {"interface_id": 24, "methods": {}},
+    "IClientNetworkingUtils": {"interface_id": 25, "methods": {}},
+    "IClientNetworkingMessages": {"interface_id": 26, "methods": {}},
+    "IClientNetworkingSocketsSerialized": {"interface_id": 27, "methods": {}},
+    "IClientAppCache": {"interface_id": 28, "methods": {}},
+    "IClientNetworkingSocketsTools": {"interface_id": 29, "methods": {}},
+}
+
+# Known method mappings (function name -> interface, method, index)
+KNOWN_METHOD_MAPPINGS = {
+    "GetSteamID": ("IClientUser", "GetSteamID", 10),
+    "BLoggedOn": ("IClientUser", "BLoggedOn", 8),
+    "GetAppOwnershipTicketExtendedData": ("IClientUser", "GetAppOwnershipTicketExtendedData", 105),
+    "RequestEncryptedAppTicket": ("IClientUser", "RequestEncryptedAppTicket", 106),
+    "GetEncryptedAppTicket": ("IClientUser", "GetEncryptedAppTicket", 107),
+    "GetAppID": ("IClientUtils", "GetAppID", 0),
+    "GetAPICallResult": ("IClientUtils", "GetAPICallResult", 1),
+    "CheckAppOwnership": ("IClientUser", "CheckAppOwnership", 104),
+    "IsSubscribedApp": ("IClientUser", "IsSubscribedApp", 103),
+    "GetConsoleSteamID": ("IClientUser", "GetConsoleSteamID", 11),
+    "ValidateSignedLicenseTicket": ("IClientUser", "ValidateSignedLicenseTicket", 108),
+    "GetDLCRestrictions": ("IClientUser", "GetDLCRestrictions", 110),
+    "GetAppUserDefinedInfo": ("IClientUser", "GetAppUserDefinedInfo", 111),
+    "GetAppBuildDir": ("IClientUtils", "GetAppBuildDir", 10),
+    "GetAllInstalledDLC": ("IClientUser", "GetAllInstalledDLC", 112),
+    "GetAppInstalledSize": ("IClientUser", "GetAppInstalledSize", 113),
+    "GetAppLanguage": ("IClientUser", "GetAppLanguage", 114),
+    "RequestAppCallbacks": ("IClientUser", "RequestAppCallbacks", 115),
+    "RequestAppCallbacksV2": ("IClientUser", "RequestAppCallbacksV2", 116),
+    "SetAllowAutoLogin": ("IClientUser", "SetAllowAutoLogin", 117),
+    "IsVACBanned": ("IClientUser", "IsVACBanned", 118),
+    "GetCurrentSessionID": ("IClientUser", "GetCurrentSessionID", 119),
+    "GetTargetIDForDLC": ("IClientUser", "GetTargetIDForDLC", 120),
+    "GetConnectingSocket": ("IClientNetworking", "GetConnectingSocket", 1),
+    "GetListenSocketToRelay": ("IClientNetworking", "GetListenSocketToRelay", 2),
+    "InitiateGameConnectionLegacy": ("IClientUser", "InitiateGameConnectionLegacy", 121),
+    "InitiateGameConnection2": ("IClientUser", "InitiateGameConnection2", 122),
+    "AuthenticateGameConnection": ("IClientUser", "AuthenticateGameConnection", 123),
+    "TerminateGameConnection": ("IClientUser", "TerminateGameConnection", 124),
+    "SendUserConnectAndAuthenticateLegacy": ("IClientUser", "SendUserConnectAndAuthenticateLegacy", 125),
+    "SendUserConnectAndAuthenticate2": ("IClientUser", "SendUserConnectAndAuthenticate2", 126),
+    "GetAuthSessionTicket": ("IClientUser", "GetAuthSessionTicket", 127),
+    "GetAuthTicketForWebApi": ("IClientUser", "GetAuthTicketForWebApi", 128),
+    "GetAppOwnershipProof": ("IClientUser", "GetAppOwnershipProof", 129),
+    "GetAppOwnershipTicket": ("IClientUser", "GetAppOwnershipTicket", 130),
+    "GetMarketEligibility": ("IClientUser", "GetMarketEligibility", 131),
+    "GetDurationControl": ("IClientUser", "GetDurationControl", 132),
+    "BSetExpandedClientInfo": ("IClientUser", "BSetExpandedClientInfo", 133),
+    "GetPartnerAccountInfo": ("IClientUser", "GetPartnerAccountInfo", 134),
+    "GetAppOwnerDebugDetails": ("IClientUser", "GetAppOwnerDebugDetails", 135),
+    "GetNumRunningApps": ("IClientUtils", "GetNumRunningApps", 11),
+    "GetRunningAppIDs": ("IClientUtils", "GetRunningAppIDs", 12),
+    "FillInAppOverview": ("IClientApps", "FillInAppOverview", 0),
+    "GetAppBuildID": ("IClientApps", "GetAppBuildID", 1),
+    "GetAllApps": ("IClientApps", "GetAllApps", 2),
+    "GetAppList": ("IClientApps", "GetAppList", 3),
+    "GetAppCount": ("IClientApps", "GetAppCount", 4),
+    "BIsAppInstalled": ("IClientApps", "BIsAppInstalled", 5),
+    "GetDLCCount": ("IClientApps", "GetDLCCount", 6),
+    "GetDLCDataByIndex": ("IClientApps", "GetDLCDataByIndex", 7),
+    "BBuildAndAsyncSendFrame": ("IClientDepotBuilder", "BBuildAndAsyncSendFrame", 0),
+    "BuildDepotDependency": ("IClientDepotBuilder", "BuildDepotDependency", 1),
+    "BuildSpawnEnvBlock": ("IClientDepotBuilder", "BuildSpawnEnvBlock", 2),
+}
+
+
+def extract_ipc_from_patterns(patterns: Dict[str, dict]) -> Dict[str, dict]:
+    """Build IPC data from pattern file entries."""
     ipc_data = {}
 
-    # Map function names to IPC interfaces
-    function_to_interface = {
-        "GetSteamID": ("IClientUser", "GetSteamID", 10),
-        "GetAppOwnershipTicketExtendedData": ("IClientUser", "GetAppOwnershipTicketExtendedData", 105),
-        "RequestEncryptedAppTicket": ("IClientUser", "RequestEncryptedAppTicket", 106),
-        "GetEncryptedAppTicket": ("IClientUser", "GetEncryptedAppTicket", 107),
-        "GetAppID": ("IClientUtils", "GetAppID", 0),
-        "GetAPICallResult": ("IClientUtils", "GetAPICallResult", 1),
-    }
+    for hash_key, entry in patterns.items():
+        name = entry.get("name", "")
+        if name not in KNOWN_METHOD_MAPPINGS:
+            continue
 
-    for func_name, info in patterns.items():
-        name = info.get("name", "")
-        if name in function_to_interface:
-            iface, method, index = function_to_interface[name]
-            if iface not in ipc_data:
-                ipc_data[iface] = {"interface_id": 0, "methods": {}}
-            ipc_data[iface]["methods"][method] = {
-                "method_index": index,
-                "funcHash": f"0x{compute_name_hash(name):08X}",
-                "wrapper_rva": info.get("rva", "0x0"),
+        iface_name, method_name, method_index = KNOWN_METHOD_MAPPINGS[name]
+        if iface_name not in ipc_data:
+            ipc_data[iface_name] = {
+                "interface_id": IPC_INTERFACES.get(iface_name, {}).get("interface_id", 0),
+                "methods": {},
             }
+
+        ipc_data[iface_name]["methods"][method_name] = {
+            "method_index": method_index,
+            "funcHash": f"0x{compute_name_hash(name):08X}",
+            "wrapper_rva": entry.get("rva", "0x0"),
+        }
 
     return ipc_data
 
 
-def generate_ipc_toml(ipc_data: Dict[str, dict]) -> str:
-    """Generate IPC TOML content."""
-    lines = []
+def find_ipc_interface_strings(pe: pefile.PE) -> Dict[str, int]:
+    """Find IPC interface name strings in the binary."""
+    results = {}
+    for iface_name in IPC_INTERFACES:
+        string_rvas = find_string_in_pe_data(pe, iface_name)
+        if string_rvas:
+            results[iface_name] = string_rvas[0]
+    return results
 
+
+def generate_ipc_toml(ipc_data: Dict[str, dict]) -> str:
+    lines = []
     for iface_name in sorted(ipc_data.keys()):
         iface_info = ipc_data[iface_name]
         lines.append(f"[{iface_name}]")
@@ -208,69 +243,53 @@ def generate_ipc_toml(ipc_data: Dict[str, dict]) -> str:
                 lines.append(f'funcHash = "{method_info["funcHash"]}"')
             if "wrapper_rva" in method_info:
                 lines.append(f'wrapper_rva = "{method_info["wrapper_rva"]}"')
-            if "fencepost" in method_info:
-                lines.append(f'fencepost = "{method_info["fencepost"]}"')
-            if "argc" in method_info:
-                lines.append(f'argc = {method_info["argc"]}')
             lines.append("")
 
     return "\n".join(lines)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Extract IPC interface layouts from Steam DLLs")
+    parser = argparse.ArgumentParser(description="Extract IPC interface layouts")
     parser.add_argument("--dll", required=True, help="Path to steamclient64.dll")
     parser.add_argument("--output", required=True, help="Output TOML file path")
     parser.add_argument("--pattern-toml", help="Existing pattern TOML for function hints")
-    parser.add_argument("--functions-json", help="JSON file with function definitions")
     args = parser.parse_args()
 
-    print(f"IPC Extractor")
+    print(f"IPC Extractor v2")
     print(f"DLL: {args.dll}")
     print(f"{'='*60}")
 
-    # Load existing patterns for hints
-    existing_patterns = {}
+    patterns = {}
     if args.pattern_toml and os.path.exists(args.pattern_toml):
-        print(f"Loading existing patterns: {args.pattern_toml}")
-        # Import from sig_scanner
-        sys.path.insert(0, os.path.dirname(__file__))
-        from sig_scanner import load_existing_patterns
-        existing_patterns = load_existing_patterns(args.pattern_toml)
-        print(f"Loaded {len(existing_patterns)} patterns")
+        print(f"Loading patterns: {args.pattern_toml}")
+        patterns = load_patterns_from_toml(args.pattern_toml)
+        print(f"Loaded {len(patterns)} patterns")
 
-    # Extract IPC data from existing patterns
-    ipc_data = extract_ipc_from_pattern_file(existing_patterns)
+    ipc_data = extract_ipc_from_patterns(patterns)
+    print(f"Extracted {len(ipc_data)} IPC interfaces from patterns")
 
-    # If we have a DLL, try to extract additional info
     if os.path.exists(args.dll):
-        print(f"\nAnalyzing DLL: {args.dll}")
+        print(f"\nAnalyzing DLL for interface strings...")
         pe = pefile.PE(args.dll)
-        print(f"Image base: 0x{pe.OPTIONAL_HEADER.ImageBase:X}")
-        print(f"Number of sections: {len(pe.sections)}")
-
-        # Try to find vtable patterns for known interfaces
-        for interface_name in list(ipc_data.keys()):
-            result = find_vtable_pattern(pe, interface_name)
-            if result:
-                ipc_data[interface_name].update(result)
-                print(f"  Found vtable for {interface_name}")
-
+        interface_strings = find_ipc_interface_strings(pe)
+        print(f"Found {len(interface_strings)} interface name strings in binary")
+        for iface_name, rva in interface_strings.items():
+            print(f"  {iface_name}: RVA=0x{rva:X}")
         pe.close()
 
-    # Generate TOML
     toml_content = generate_ipc_toml(ipc_data)
-
-    # Save output
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     with open(args.output, "w") as f:
         f.write(toml_content)
 
     print(f"\nOutput saved to: {args.output}")
     print(f"Total interfaces: {len(ipc_data)}")
+    total_methods = 0
     for iface_name, info in sorted(ipc_data.items()):
         method_count = len(info.get("methods", {}))
+        total_methods += method_count
         print(f"  {iface_name}: {method_count} methods")
+    print(f"Total methods: {total_methods}")
 
 
 if __name__ == "__main__":
