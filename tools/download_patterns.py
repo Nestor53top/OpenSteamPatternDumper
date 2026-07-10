@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-Download all known patterns from steam-monitor repository.
-Used by GitHub Actions workflow to build reference pattern set.
+Download ALL branches from steam-monitor: pattern, ipc, protobuf.
 """
 
 import os
@@ -9,6 +8,7 @@ import sys
 import json
 import urllib.request
 import urllib.error
+import base64
 
 
 def fetch_json(url, token=None):
@@ -18,79 +18,126 @@ def fetch_json(url, token=None):
     }
     if token:
         headers["Authorization"] = f"token {token}"
-
     req = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except Exception as e:
-        print(f"  Error fetching {url}: {e}")
+        print(f"  Error: {e}")
         return None
 
 
-def fetch_raw(url, token=None):
+def fetch_raw_content(url, token=None):
     headers = {
         "Accept": "application/vnd.github.v3.raw",
         "User-Agent": "OpenSteamPatternDumper",
     }
     if token:
         headers["Authorization"] = f"token {token}"
-
     req = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             return resp.read().decode("utf-8")
     except Exception as e:
-        print(f"  Error fetching {url}: {e}")
+        print(f"  Error: {e}")
         return None
 
 
-def download_patterns(repo, branch, component, output_dir, token=None):
-    """Download all pattern files for a component."""
-    url = f"https://api.github.com/repos/{repo}/contents/{component}?ref={branch}"
-    print(f"Fetching {component} pattern list from {repo}...")
+def fetch_base64_content(url, token=None):
+    headers = {
+        "Accept": "application/vnd.github.v3+json",
+        "User-Agent": "OpenSteamPatternDumper",
+    }
+    if token:
+        headers["Authorization"] = f"token {token}"
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            if "content" in data:
+                return base64.b64decode(data["content"]).decode("utf-8")
+    except Exception as e:
+        print(f"  Error: {e}")
+    return None
 
+
+def list_dir(repo, branch, path, token=None):
+    url = f"https://api.github.com/repos/{repo}/contents/{path}?ref={branch}"
     data = fetch_json(url, token)
-    if not data or not isinstance(data, list):
-        print(f"  Failed to list {component} patterns")
-        return 0
+    if isinstance(data, list):
+        return data
+    return []
 
-    os.makedirs(output_dir, exist_ok=True)
+
+def download_branch(repo, branch, component, output_dir, token=None, extensions=None):
+    """Download all files from a branch/path."""
+    if extensions is None:
+        extensions = [".toml", ".proto"]
+
+    files = list_dir(repo, branch, component, token)
     count = 0
 
-    for item in data:
+    for item in files:
         name = item.get("name", "")
-        if not name.endswith(".toml"):
+        item_type = item.get("type", "")
+
+        if item_type == "dir":
+            sub_count = download_branch(
+                repo, branch, f"{component}/{name}", output_dir, token, extensions
+            )
+            count += sub_count
+            continue
+
+        if not any(name.endswith(ext) for ext in extensions):
             continue
 
         raw_url = f"https://raw.githubusercontent.com/{repo}/{branch}/{component}/{name}"
-        content = fetch_raw(raw_url, token)
+        content = fetch_raw_content(raw_url, token)
         if content:
             out_path = os.path.join(output_dir, name)
+            os.makedirs(os.path.dirname(out_path), exist_ok=True)
             with open(out_path, "w") as f:
                 f.write(content)
             count += 1
 
-    print(f"  Downloaded {count} {component} pattern files")
     return count
 
 
 def main():
     import argparse
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo", default="OpenSteam001/steam-monitor")
-    parser.add_argument("--branch", default="pattern")
-    parser.add_argument("--output-dir", default="patterns_ref")
+    parser.add_argument("--output-dir", default="steam_monitor_data")
     parser.add_argument("--token", default=os.environ.get("GITHUB_TOKEN", ""))
     args = parser.parse_args()
 
     total = 0
-    for component in ["steamclient", "steamui"]:
-        out_dir = os.path.join(args.output_dir, component)
-        count = download_patterns(args.repo, args.branch, component, out_dir, args.token)
+
+    # 1. Pattern branch
+    print("=== Downloading PATTERN branch ===")
+    for comp in ["steamclient", "steamui"]:
+        out_dir = os.path.join(args.output_dir, "pattern", comp)
+        count = download_branch(args.repo, "pattern", comp, out_dir, args.token, [".toml"])
+        print(f"  {comp}: {count} files")
         total += count
 
-    print(f"\nTotal: {total} pattern files downloaded")
+    # 2. IPC branch
+    print("\n=== Downloading IPC branch ===")
+    out_dir = os.path.join(args.output_dir, "ipc", "steamclient")
+    count = download_branch(args.repo, "ipc", "steamclient", out_dir, args.token, [".toml"])
+    print(f"  steamclient: {count} files")
+    total += count
+
+    # 3. Protobuf branch
+    print("\n=== Downloading PROTOBUF branch ===")
+    for comp in ["steamclient", "steamui"]:
+        out_dir = os.path.join(args.output_dir, "protobuf", comp)
+        count = download_branch(args.repo, "protobuf", comp, out_dir, args.token, [".proto"])
+        print(f"  {comp}: {count} files")
+        total += count
+
+    print(f"\nTotal: {total} files downloaded")
     return total
 
 

@@ -26,13 +26,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install pefile requests
 
-      - name: Download all reference patterns from steam-monitor
+      - name: Download ALL data from steam-monitor (pattern + ipc + protobuf)
         run: |
-          python tools/download_patterns.py --output-dir patterns_ref --token ${{ secrets.GITHUB_TOKEN }}
+          python tools/download_patterns.py --output-dir steam_monitor_data --token ${{ secrets.GITHUB_TOKEN }}
 
       - name: Merge reference patterns
         run: |
-          python tools/merge_patterns.py --patterns-dir patterns_ref --output output/merged_reference.json
+          python tools/merge_patterns.py --patterns-dir steam_monitor_data/pattern --output output/merged_reference.json
 
       - name: Install and run Steam to download files
         run: |
@@ -73,7 +73,7 @@ jobs:
           
           $steamExe = Join-Path $steamPath "steam.exe"
           if (Test-Path $steamExe) {
-            Write-Host "=== Running Steam to download client files ==="
+            Write-Host "=== Running Steam ==="
             Start-Process -FilePath $steamExe -ArgumentList "-no-browser -nochatui -silent" -ErrorAction SilentlyContinue
             
             $maxWait = 120
@@ -99,10 +99,9 @@ jobs:
                 Write-Host "All DLLs found!"
                 break
               }
-              Write-Host "  Waiting... ($elapsed/$maxWait sec) - Found: $($dllsFound.Count)/2"
+              Write-Host "  Waiting... ($elapsed/$maxWait sec)"
             }
             
-            Write-Host "=== Killing Steam ==="
             Get-Process -Name "steam" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
             Get-Process -Name "steamwebhelper" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
             Start-Sleep -Seconds 3
@@ -123,41 +122,31 @@ jobs:
               Write-Host "$dll SHA-256: $hash"
               $envVar = "HASH_" + $dll.Replace(".dll","").Replace("64","")
               echo "$envVar=$hash" | Out-File -FilePath $env:GITHUB_ENV -Append
-            } else {
-              Write-Host "$dll NOT FOUND"
             }
           }
 
-      - name: Extract ALL exports from steamclient64.dll
+      - name: Extract ALL exports from DLLs
         run: |
-          Write-Host "=== Extracting steamclient64 exports ==="
           python tools/extract_exports.py --dll output/steamclient64.dll --component steamclient --output output/exports_steamclient.json
-
-      - name: Extract ALL exports from steamui.dll
-        run: |
-          Write-Host "=== Extracting steamui exports ==="
           python tools/extract_exports.py --dll output/steamui.dll --component steamui --output output/exports_steamui.json
 
       - name: Build comprehensive function list
         run: |
-          python tools/build_function_list.py --patterns-dir patterns_ref --exports-dir output --output output/all_functions.json
+          python tools/build_function_list.py --patterns-dir steam_monitor_data/pattern --exports-dir output --output output/all_functions.json
 
       - name: Scan steamclient64.dll with ALL functions
         run: |
-          Write-Host "=== Scanning steamclient64.dll ==="
           python tools/sig_scanner.py --dll output/steamclient64.dll --component steamclient --output output/steamclient64.toml --functions-json output/all_functions.json
 
       - name: Scan steamui.dll with ALL functions
         run: |
-          Write-Host "=== Scanning steamui.dll ==="
           python tools/sig_scanner.py --dll output/steamui.dll --component steamui --output output/steamui.toml --functions-json output/all_functions.json
 
-      - name: Extract IPC vtable layouts
+      - name: Extract IPC vtables (merging steam-monitor IPC data)
         run: |
-          Write-Host "=== Extracting IPC vtables ==="
-          python tools/ipc_extractor.py --dll output/steamclient64.dll --output output/ipc_vtables.toml --pattern-toml output/steamclient64.toml
+          python tools/ipc_extractor.py --dll output/steamclient64.dll --output output/ipc_vtables.toml --pattern-toml output/steamclient64.toml --steam-monitor-ipc-dir steam_monitor_data/ipc/steamclient
 
-      - name: Download matching patterns from steam-monitor
+      - name: Copy matching patterns from steam-monitor
         run: |
           $outputDir = "output"
           New-Item -ItemType Directory -Force -Path "$outputDir\patterns_match"
@@ -178,11 +167,10 @@ jobs:
               $outFile = "$outputDir\patterns_match\${comp}_${hash}.toml"
               try {
                 Invoke-WebRequest -Uri $url -OutFile $outFile -TimeoutSec 15 -ErrorAction Stop
-                $size = (Get-Item $outFile).Length
-                Write-Host "SUCCESS: Found $comp pattern ($size bytes)"
+                Write-Host "SUCCESS: Found $comp pattern"
               } catch {
                 Write-Host "Pattern not found for $comp (new version)"
-                Set-Content -Path $outFile -Value "# SHA-256: $hash - not in steam-monitor (new version)"
+                Set-Content -Path $outFile -Value "# SHA-256: $hash - not in steam-monitor"
               }
             }
           }
@@ -201,24 +189,32 @@ jobs:
             timestamp = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
           } | ConvertTo-Json | Out-File "$outputDir\steam_info.json"
 
-      - name: Create output directory structure
+      - name: Create final output
         run: |
           $outDir = "output/final"
           New-Item -ItemType Directory -Force -Path $outDir
           New-Item -ItemType Directory -Force -Path "$outDir/steamclient"
           New-Item -ItemType Directory -Force -Path "$outDir/steamui"
           New-Item -ItemType Directory -Force -Path "$outDir/ipc"
+          New-Item -ItemType Directory -Force -Path "$outDir/protobuf/steamclient"
+          New-Item -ItemType Directory -Force -Path "$outDir/protobuf/steamui"
           
           Copy-Item "output/steam_info.json" "$outDir/"
-          Copy-Item "output/steamclient64.toml" "$outDir/steamclient/"
-          Copy-Item "output/steamui.toml" "$outDir/steamui/"
-          Copy-Item "output/ipc_vtables.toml" "$outDir/ipc/"
-          Copy-Item "output/exports_steamclient.json" "$outDir/steamclient/"
-          Copy-Item "output/exports_steamui.json" "$outDir/steamui/"
           Copy-Item "output/all_functions.json" "$outDir/"
-
-      - name: Create archive
-        run: |
+          Copy-Item "output/merged_reference.json" "$outDir/"
+          Copy-Item "output/steamclient64.toml" "$outDir/steamclient/"
+          Copy-Item "output/exports_steamclient.json" "$outDir/steamclient/"
+          Copy-Item "output/steamui.toml" "$outDir/steamui/"
+          Copy-Item "output/exports_steamui.json" "$outDir/steamui/"
+          Copy-Item "output/ipc_vtables.toml" "$outDir/ipc/"
+          
+          if (Test-Path "steam_monitor_data/protobuf/steamclient") {
+            Copy-Item "steam_monitor_data/protobuf/steamclient/*.proto" "$outDir/protobuf/steamclient/" -ErrorAction SilentlyContinue
+          }
+          if (Test-Path "steam_monitor_data/protobuf/steamui") {
+            Copy-Item "steam_monitor_data/protobuf/steamui/*.proto" "$outDir/protobuf/steamui/" -ErrorAction SilentlyContinue
+          }
+          
           $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
           Compress-Archive -Path "output/final/*" -DestinationPath "steam-patterns-$timestamp.zip" -Force
           Write-Host "Created: steam-patterns-$timestamp.zip"
@@ -237,8 +233,6 @@ jobs:
             output/steam_info.json
             output/merged_reference.json
             output/patterns_match/
-            output/steamclient64.dll
-            output/steamui.dll
             output/final/
           retention-days: 30
 
@@ -254,28 +248,34 @@ jobs:
           }
           
           if (Test-Path "output/exports_steamclient.json") {
-            $count = (Get-Content "output/exports_steamclient.json" | ConvertFrom-Json).Count
-            Write-Host "`nsteamclient64.dll exports: $count"
+            $ec = (Get-Content "output/exports_steamclient.json" | ConvertFrom-Json).Count
+            Write-Host "`nsteamclient64.dll exports: $ec"
           }
           if (Test-Path "output/exports_steamui.json") {
-            $count = (Get-Content "output/exports_steamui.json" | ConvertFrom-Json).Count
-            Write-Host "steamui.dll exports: $count"
+            $eu = (Get-Content "output/exports_steamui.json" | ConvertFrom-Json).Count
+            Write-Host "steamui.dll exports: $eu"
           }
           
           if (Test-Path "output/steamclient64.toml") {
-            $count = (Get-Content "output/steamclient64.toml" | Select-String "^\[" | Measure-Object).Count
-            Write-Host "`nsteamclient64 patterns found: $count"
+            $sc = (Get-Content "output/steamclient64.toml" | Select-String "^\[" | Measure-Object).Count
+            Write-Host "`nsteamclient64 patterns: $sc"
           }
           if (Test-Path "output/steamui.toml") {
-            $count = (Get-Content "output/steamui.toml" | Select-String "^\[" | Measure-Object).Count
-            Write-Host "steamui patterns found: $count"
+            $su = (Get-Content "output/steamui.toml" | Select-String "^\[" | Measure-Object).Count
+            Write-Host "steamui patterns: $su"
           }
           if (Test-Path "output/ipc_vtables.toml") {
-            $count = (Get-Content "output/ipc_vtables.toml" | Select-String "^\[" | Measure-Object).Count
-            Write-Host "IPC interfaces: $count"
+            $ipc = (Get-Content "output/ipc_vtables.toml" | Select-String "^\[" | Measure-Object).Count
+            Write-Host "IPC interfaces/methods: $ipc"
           }
           
-          Write-Host "`nOutput files:"
+          $protoCount = 0
+          if (Test-Path "output/final/protobuf/steamclient") {
+            $protoCount = (Get-ChildItem "output/final/protobuf/steamclient/*.proto" -ErrorAction SilentlyContinue).Count
+          }
+          Write-Host "Protobuf definitions: $protoCount"
+          
+          Write-Host "`nAll output files:"
           Get-ChildItem "output" -Recurse -File | ForEach-Object {
             $rel = $_.FullName.Replace((Get-Location).Path + "\output\", "")
             Write-Host "  $rel ($([math]::Round($_.Length / 1KB, 2)) KB)"
