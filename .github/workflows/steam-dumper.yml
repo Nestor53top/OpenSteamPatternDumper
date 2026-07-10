@@ -142,9 +142,55 @@ jobs:
         run: |
           python tools/sig_scanner.py --dll output/steamui.dll --component steamui --output output/steamui.toml --functions-json output/all_functions.json
 
+      - name: Find MISSING functions via string references
+        run: |
+          echo "=== Finding patterns for 27 missing steam-monitor functions ==="
+          python tools/string_ref_fast.py --dll output/steamclient64.dll --functions-json steam_monitor_data/pattern/steamclient/merged.json --output output/string_ref_patterns.json
+          
+          echo ""
+          echo "=== Results ==="
+          python -c "
+import json
+with open('output/string_ref_patterns.json') as f:
+    d = json.load(f)
+print(f'Found via string refs: {len(d)}')
+for name, data in d.items():
+    print(f'  {name}: {data[\"sig\"][:40]}...')
+"
+
+      - name: Merge ALL patterns into final TOML
+        run: |
+          python -c "
+import json, os
+
+# Load our scanned patterns
+with open('output/steamclient64.toml') as f:
+    lines = f.readlines()
+
+# Load string ref patterns
+string_ref = {}
+if os.path.exists('output/string_ref_patterns.json'):
+    with open('output/string_ref_patterns.json') as f:
+        string_ref = json.load(f)
+
+# Add string ref patterns to the end
+for name, data in string_ref.items():
+    lines.append(f'[{name}]\n')
+    lines.append(f'sig = \"{data[\"sig\"]}\"\n')
+    lines.append(f'rva = \"{data[\"rva\"]}\"\n')
+    lines.append(f'source = \"string_ref\"\n')
+    lines.append('\n')
+
+# Write final
+with open('output/steamclient64_final.toml', 'w') as f:
+    f.writelines(lines)
+
+print(f'Total patterns: {50 + len(string_ref)} (50 scanned + {len(string_ref)} string-ref)')
+"
+
       - name: Extract IPC vtables (merging steam-monitor IPC data)
         run: |
-          python tools/ipc_extractor.py --dll output/steamclient64.dll --output output/ipc_vtables.toml --pattern-toml output/steamclient64.toml --steam-monitor-ipc-dir steam_monitor_data/ipc/steamclient
+          python tools/ipc_extractor.py --dll output/steamclient64.dll --output output/ipc_vtables.toml --pattern-toml output/steamclient64_final.toml --steam-monitor-ipc-dir steam_monitor_data/ipc/steamclient
 
       - name: Copy matching patterns from steam-monitor
         run: |
@@ -202,8 +248,9 @@ jobs:
           Copy-Item "output/steam_info.json" "$outDir/"
           Copy-Item "output/all_functions.json" "$outDir/"
           Copy-Item "output/merged_reference.json" "$outDir/"
-          Copy-Item "output/steamclient64.toml" "$outDir/steamclient/"
+          Copy-Item "output/steamclient64_final.toml" "$outDir/steamclient/steamclient64.toml"
           Copy-Item "output/exports_steamclient.json" "$outDir/steamclient/"
+          Copy-Item "output/string_ref_patterns.json" "$outDir/steamclient/"
           Copy-Item "output/steamui.toml" "$outDir/steamui/"
           Copy-Item "output/exports_steamui.json" "$outDir/steamui/"
           Copy-Item "output/ipc_vtables.toml" "$outDir/ipc/"
@@ -224,7 +271,8 @@ jobs:
         with:
           name: steam-patterns-${{ github.run_number }}
           path: |
-            output/steamclient64.toml
+            output/steamclient64_final.toml
+            output/string_ref_patterns.json
             output/steamui.toml
             output/ipc_vtables.toml
             output/exports_steamclient.json
