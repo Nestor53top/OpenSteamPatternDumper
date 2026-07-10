@@ -113,16 +113,28 @@ jobs:
           $outputDir = "output"
           New-Item -ItemType Directory -Force -Path $outputDir
           
+          $found = 0
           foreach ($dll in @("steamclient64.dll", "steamui.dll")) {
             $src = Join-Path $steamPath $dll
             $dst = Join-Path $outputDir $dll
             if (Test-Path $src) {
               Copy-Item -Path $src -Destination $dst -Force
+              $size = (Get-Item $dst).Length
               $hash = (Get-FileHash -Path $dst -Algorithm SHA256).Hash.ToLower()
-              Write-Host "$dll SHA-256: $hash"
+              Write-Host "$dll SIZE=$size SHA256=$hash"
               $envVar = "HASH_" + $dll.Replace(".dll","").Replace("64","")
               echo "$envVar=$hash" | Out-File -FilePath $env:GITHUB_ENV -Append
+              $found++
+            } else {
+              Write-Host "WARNING: $dll NOT FOUND at $src"
             }
+          }
+          
+          if ($found -eq 0) {
+            Write-Host "ERROR: No DLLs found! Steam installation may have failed."
+            Write-Host "Listing Steam directory:"
+            Get-ChildItem $steamPath -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $($_.Name) ($($_.Length))" }
+            exit 1
           }
 
       - name: Extract ALL exports from DLLs
@@ -144,8 +156,8 @@ jobs:
 
       - name: Find MISSING functions via string references
         run: |
-          echo "=== Finding patterns for 27 missing steam-monitor functions ==="
-          python tools/string_ref_fast.py --dll output/steamclient64.dll --functions-json steam_monitor_data/pattern/steamclient/merged.json --output output/string_ref_patterns.json
+          echo "=== Finding patterns for missing steam-monitor functions ==="
+          python tools/string_ref_fast.py --dll output/steamclient64.dll --functions-json output/all_functions.json --output output/string_ref_patterns.json
           
           echo ""
           echo "=== Results ==="
