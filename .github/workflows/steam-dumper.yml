@@ -24,7 +24,7 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pefile requests
+          pip install pefile requests psutil
 
       - name: Download ALL data from steam-monitor (pattern + ipc + protobuf)
         run: |
@@ -102,12 +102,10 @@ jobs:
               Write-Host "  Waiting... ($elapsed/$maxWait sec)"
             }
             
-            Get-Process -Name "steam" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-            Get-Process -Name "steamwebhelper" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-            Start-Sleep -Seconds 3
+            Write-Host "Steam is still running for proto dump..."
           }
 
-      - name: Extract DLLs and compute hashes
+      - name: Extract DLLs and compute hashes (while Steam runs)
         run: |
           $steamPath = $env:STEAM_PATH
           $outputDir = "output"
@@ -136,6 +134,52 @@ jobs:
             Get-ChildItem $steamPath -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $($_.Name) ($($_.Length))" }
             exit 1
           }
+
+      - name: Runtime proto dump from running Steam (RD.py)
+        run: |
+          Write-Host "=== Runtime Proto Dump from Steam Process ==="
+          Write-Host "Steam should still be running..."
+          
+          $steamPath = $env:STEAM_PATH
+          if (-not $steamPath) {
+            $steamPath = "C:\Program Files (x86)\Steam"
+          }
+          
+          # Find steam.exe PID
+          $steamPids = Get-Process -Name "steam" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id
+          if ($steamPids) {
+            Write-Host "Found Steam PIDs: $($steamPids -join ', ')"
+            $targetPid = $steamPids[0]
+          } else {
+            Write-Host "No steam.exe found, trying steamwebhelper..."
+            $webhelper = Get-Process -Name "steamwebhelper" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($webhelper) {
+              $targetPid = $webhelper.Id
+              Write-Host "Using steamwebhelper PID: $targetPid"
+            } else {
+              Write-Host "WARNING: No Steam process found, skipping runtime proto dump"
+              $targetPid = $null
+            }
+          }
+          
+          if ($targetPid) {
+            Write-Host "Dumping protos from PID $targetPid..."
+            python tools/rd_protodump.py --pid $targetPid --output output/protos_runtime --verbose
+            
+            if (Test-Path "output/protos_runtime") {
+              $count = (Get-ChildItem "output/protos_runtime/*.proto" -ErrorAction SilentlyContinue).Count
+              Write-Host "Runtime proto dump: $count files"
+            } else {
+              Write-Host "WARNING: No protos dumped"
+            }
+          }
+
+      - name: Kill Steam after proto dump
+        run: |
+          Get-Process -Name "steam" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          Get-Process -Name "steamwebhelper" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 3
+          Write-Host "Steam processes terminated"
 
       - name: Extract ALL exports from DLLs
         run: |
@@ -241,6 +285,14 @@ jobs:
             Copy-Item "steam_monitor_data/protobuf/steamui/*.proto" "$outDir/protobuf/steamui/" -ErrorAction SilentlyContinue
           }
           
+          # Add runtime protos (from RD.py)
+          if (Test-Path "output/protos_runtime") {
+            New-Item -ItemType Directory -Force -Path "$outDir/protos_runtime"
+            Copy-Item "output/protos_runtime/*" "$outDir/protos_runtime/" -ErrorAction SilentlyContinue
+            $rtCount = (Get-ChildItem "$outDir/protos_runtime/*.proto" -ErrorAction SilentlyContinue).Count
+            Write-Host "Runtime protos added: $rtCount files"
+          }
+          
           $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
           Compress-Archive -Path "output/final/*" -DestinationPath "steam-patterns-$timestamp.zip" -Force
           Write-Host "Created: steam-patterns-$timestamp.zip"
@@ -260,6 +312,7 @@ jobs:
             output/steam_info.json
             output/merged_reference.json
             output/patterns_match/
+            output/protos_runtime/
             output/final/
           retention-days: 30
 
@@ -300,7 +353,13 @@ jobs:
           if (Test-Path "output/final/protobuf/steamclient") {
             $protoCount = (Get-ChildItem "output/final/protobuf/steamclient/*.proto" -ErrorAction SilentlyContinue).Count
           }
-          Write-Host "Protobuf definitions: $protoCount"
+          Write-Host "Protobuf definitions (steam-monitor): $protoCount"
+          
+          $rtProtoCount = 0
+          if (Test-Path "output/protos_runtime") {
+            $rtProtoCount = (Get-ChildItem "output/protos_runtime/*.proto" -ErrorAction SilentlyContinue).Count
+          }
+          Write-Host "Protobuf definitions (runtime dump): $rtProtoCount"
           
           Write-Host "`nAll output files:"
           Get-ChildItem "output" -Recurse -File | ForEach-Object {
